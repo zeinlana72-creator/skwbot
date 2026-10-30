@@ -8,7 +8,16 @@ from datetime import datetime, time, timezone, timedelta
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeChat
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -828,7 +837,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def post_init(application):
-    """Mendaftarkan menu perintah (Bot Commands) ke aplikasi Telegram."""
+    """Mendaftarkan menu perintah (Bot Commands) ke aplikasi Telegram khusus di chat pribadi."""
     commands = [
         BotCommand("start", "Mulai bot & menu utama"),
         BotCommand("report", "Laporan SINGKAWANG (/report [teknisi] [kendala])"),
@@ -839,10 +848,19 @@ async def post_init(application):
         BotCommand("help", "Panduan dan bantuan penggunaan bot")
     ]
     try:
-        await application.bot.set_my_commands(commands)
-        logger.info("Bot commands berhasil didaftarkan ke Telegram.")
+        # Hapus seluruh tombol perintah (/) di seluruh grup dan khusus grup target
+        await application.bot.delete_my_commands(scope=BotCommandScopeDefault())
+        await application.bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
+        try:
+            await application.bot.delete_my_commands(scope=BotCommandScopeChat(config.TARGET_GROUP_ID))
+        except Exception:
+            pass
+
+        # Daftarkan tombol perintah (/) HANYA di chat pribadi (DM)
+        await application.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+        logger.info("Bot commands berhasil didaftarkan khusus chat pribadi (dihapus dari grup).")
     except Exception as e:
-        logger.warning(f"Gagal mendaftarkan bot commands ke Telegram: {e}")
+        logger.warning(f"Gagal mengatur bot commands ke Telegram: {e}")
 
 async def handle_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menangani tombol Kembali ke Menu Utama."""
