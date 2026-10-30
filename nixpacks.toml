@@ -1,5 +1,7 @@
-[phases.setup]
-nixPkgs = ["chromium"]
+# Fallback konfigurasi jika Railway diatur menggunakan Nixpacks
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
 
-[phases.build]
-cmds = ["python -m playwright install --with-deps chromium"]
+[phases.playwright]
+dependsOn = ["install"]
+cmds = ["playwright install chromium"]
