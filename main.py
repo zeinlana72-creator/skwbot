@@ -1,7 +1,13 @@
 import logging
 import asyncio
 import io
+import sys
 from datetime import datetime
+
+# Pastikan output konsol mendukung karakter emoji (khususnya di Windows)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     ApplicationBuilder,
