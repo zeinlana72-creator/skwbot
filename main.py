@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import io
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
@@ -13,6 +14,7 @@ from telegram.ext import (
 )
 import config
 from sheets_handler import SheetsHandler
+from dashboard_capture import capture_productivity_dashboard
 
 # Konfigurasi Logging
 logging.basicConfig(
@@ -70,6 +72,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("🏢 Laporan SA MEMPAWAH (/report)", callback_data="menu_sa_mempawah")
+        ],
+        [
+            InlineKeyboardButton("📸 Dashboard Produktivitas (/dashboard)", callback_data="menu_dashboard")
         ],
         [
             InlineKeyboardButton("⏰ Cek Berkas Pending", callback_data="menu_check_docs")
@@ -345,6 +350,78 @@ async def handle_sa_mempawah_callback(update: Update, context: ContextTypes.DEFA
 
     elif data == "report_help_info":
         await show_report_help(update)
+
+# --- ALUR: DASHBOARD PRODUKTIVITAS TEKNISI (/dashboard) ---
+
+async def handle_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mengambil screenshot dashboard Assurance dan merangkum analisis produktivitas teknisi."""
+    user = update.effective_user
+    if not is_authorized(user.id):
+        if update.message:
+            await update.message.reply_text("Maaf, Anda tidak memiliki izin untuk menggunakan bot ini.")
+        elif update.callback_query:
+            await update.callback_query.answer("Akses ditolak.", show_alert=True)
+        return
+
+    chat_id = update.effective_chat.id
+    if update.callback_query:
+        await update.callback_query.answer()
+        status_msg = await update.callback_query.message.reply_text(
+            "⏳ Sedang mengambil tangkapan layar dashboard Assurance dan menganalisis rekap teknisi...\n_(Membutuhkan beberapa detik)_"
+        )
+    else:
+        status_msg = await update.message.reply_text(
+            "⏳ Sedang mengambil tangkapan layar dashboard Assurance dan menganalisis rekap teknisi...\n_(Membutuhkan beberapa detik)_"
+        )
+
+    try:
+        screenshot_bytes, desc = await capture_productivity_dashboard()
+
+        photo_file = io.BytesIO(screenshot_bytes)
+        photo_file.name = "dashboard_produktivitas.png"
+
+        keyboard = [
+            [
+                InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="menu_dashboard"),
+                InlineKeyboardButton("🏢 Laporan SA MEMPAWAH", callback_data="menu_sa_mempawah")
+            ],
+            [
+                InlineKeyboardButton("⬅️ Menu Utama", callback_data="menu_back")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Caption batas 1024 karakter di Telegram
+        if len(desc) <= 1024:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=photo_file,
+                caption=desc,
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+        else:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=photo_file
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=desc,
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+
+        if status_msg:
+            await status_msg.delete()
+
+    except Exception as e:
+        logger.error(f"Gagal memproses dashboard capture: {e}", exc_info=True)
+        err_msg = f"❌ Terjadi kesalahan saat mengambil dashboard:\n`{str(e)}`"
+        if status_msg:
+            await status_msg.edit_text(err_msg, parse_mode="Markdown")
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=err_msg, parse_mode="Markdown")
 
 # --- ALUR PERCAKAPAN: UPDATE STATUS WO ---
 
@@ -672,11 +749,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  - `/report [jml_teknisi] [kendala...]` contoh: `/report 12 Hujan deras di beberapa titik`\n"
         "• `/rekap` atau `/laporan` - Perintah cepat untuk laporan operasional\n"
         "• `/samempawah` - Perintah khusus laporan SA Mempawah\n"
+        "• `/dashboard` - Tangkapan layar tabel produktivitas teknisi & analisis rekap\n"
         "• `/help` - Menampilkan panduan bantuan ini\n\n"
         "💡 Anda juga dapat mengklik tombol pada menu utama `/start` untuk mengelola WO, memperbarui status, dan menyusun pesan tagihan otomatis."
     )
     keyboard = [
-        [InlineKeyboardButton("🏢 Buat Laporan Sekarang", callback_data="menu_sa_mempawah")],
+        [
+            InlineKeyboardButton("🏢 Laporan SA MEMPAWAH", callback_data="menu_sa_mempawah"),
+            InlineKeyboardButton("📸 Dashboard Produktivitas", callback_data="menu_dashboard")
+        ],
         [InlineKeyboardButton("📱 Menu Utama", callback_data="menu_back")]
     ]
     await update.message.reply_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -686,6 +767,7 @@ async def post_init(application):
     commands = [
         BotCommand("start", "Mulai bot & menu utama"),
         BotCommand("report", "Laporan SA MEMPAWAH (/report [teknisi] [kendala])"),
+        BotCommand("dashboard", "Screenshot dashboard & rekap teknisi"),
         BotCommand("laporan", "Laporan operasional & tiket"),
         BotCommand("rekap", "Rekapitulasi berkas & order"),
         BotCommand("samempawah", "Laporan SA MEMPAWAH"),
@@ -801,6 +883,12 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("bantuan", help_command))
     
+    # Perintah Dashboard Produktivitas Teknisi
+    application.add_handler(CommandHandler(
+        ["dashboard", "produktivitas", "capture", "teknisi"],
+        handle_dashboard
+    ))
+
     # Perintah Laporan / Report (dengan berbagai alias & variasi penulisan)
     application.add_handler(CommandHandler(
         ["report", "reaport", "laporan", "rekap", "SAMEMPAWAH", "samempawah"],
@@ -815,6 +903,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_list_wo, pattern="^menu_list_wo$"))
     application.add_handler(CallbackQueryHandler(handle_menu_sa_mempawah, pattern="^menu_sa_mempawah$"))
     application.add_handler(CallbackQueryHandler(handle_sa_mempawah_callback, pattern="^(sa_mempawah_|report_)"))
+    application.add_handler(CallbackQueryHandler(handle_dashboard, pattern="^menu_dashboard$"))
     application.add_handler(CallbackQueryHandler(handle_check_docs, pattern="^menu_check_docs$"))
     application.add_handler(CallbackQueryHandler(handle_menu_back, pattern="^menu_back$"))
 
