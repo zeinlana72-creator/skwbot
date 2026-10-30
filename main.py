@@ -2,7 +2,7 @@ import logging
 import asyncio
 import io
 import sys
-from datetime import datetime
+from datetime import datetime, time, timezone, timedelta
 
 # Pastikan output konsol mendukung karakter emoji (khususnya di Windows)
 if hasattr(sys.stdout, "reconfigure"):
@@ -16,6 +16,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     MessageHandler,
     ConversationHandler,
+    TypeHandler,
+    ApplicationHandlerStop,
     filters
 )
 import config
@@ -50,6 +52,21 @@ def is_authorized(user_id: int) -> bool:
         # Jika tidak dikonfigurasi, semua orang diizinkan (untuk testing/kemudahan)
         return True
     return user_id in config.ALLOWED_TELEGRAM_IDS
+
+async def block_group_interactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Memastikan anggota grup TARGET_GROUP_ID (-1001342185601)
+    tidak dapat melakukan perintah apapun di dalam grup.
+    """
+    chat = update.effective_chat
+    if chat and chat.id == config.TARGET_GROUP_ID:
+        # Jika ada perintah teks (seperti /start, /report, /dashboard, dll) dari anggota grup
+        if update.message and update.message.text and update.message.text.startswith("/"):
+            raise ApplicationHandlerStop
+        # Jika ada interaksi tombol inline di grup
+        if update.callback_query:
+            await update.callback_query.answer("Perintah dinonaktifkan di grup ini.", show_alert=False)
+            raise ApplicationHandlerStop
 
 # --- FUNGSI UTAMA / COMMANDS ---
 
@@ -703,6 +720,41 @@ async def gemini_wo_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # --- BACKGROUND SCHEDULER / TIMER ---
 
+async def send_scheduled_dashboard_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Mengirim laporan Dashboard Produktivitas secara otomatis ke grup target (-1001342185601)
+    setiap 2 jam sekali dari jam 07.00 - 20.00 WIB setiap hari.
+    """
+    target_chat_id = config.TARGET_GROUP_ID
+    logger.info(f"Auto Dashboard Job: Mengambil data dan screenshot dashboard untuk grup {target_chat_id}...")
+    try:
+        screenshot_bytes, desc = await capture_productivity_dashboard()
+
+        photo_file = io.BytesIO(screenshot_bytes)
+        photo_file.name = "dashboard_produktivitas.png"
+
+        # Kirim foto langsung tanpa tombol navigasi agar anggota grup tidak melakukan interaksi perintah
+        if len(desc) <= 1024:
+            await context.bot.send_photo(
+                chat_id=target_chat_id,
+                photo=photo_file,
+                caption=desc,
+                parse_mode="Markdown"
+            )
+        else:
+            await context.bot.send_photo(
+                chat_id=target_chat_id,
+                photo=photo_file
+            )
+            await context.bot.send_message(
+                chat_id=target_chat_id,
+                text=desc,
+                parse_mode="Markdown"
+            )
+        logger.info(f"Auto Dashboard Job: Berhasil mengirim laporan otomatis ke grup {target_chat_id}")
+    except Exception as e:
+        logger.error(f"Auto Dashboard Job: Gagal mengirim ke grup {target_chat_id}: {e}", exc_info=True)
+
 async def run_daily_recap_job(context: ContextTypes.DEFAULT_TYPE):
     """Pekerjaan terjadwal: Mengirimkan rekap WO belum lengkap berkas setiap hari."""
     logger.info("Scheduler: Memulai pengecekan berkas tertunda harian...")
@@ -837,12 +889,21 @@ def main():
     )
 
     # 4. Registrasi Schedulers (Background Jobs)
-    # Jadwalkan pekerjaan recap berkas harian. Berjalan setiap 12 jam (43200 detik)
-    # Anda juga dapat menyesuaikan untuk waktu tertentu menggunakan run_daily
     job_queue = application.job_queue
     if job_queue:
-        # Menjadwalkan job pertama berjalan setelah 10 detik, dan diulang setiap 12 jam
-        job_queue.run_repeating(run_daily_recap_job, interval=43200, first=10)
+        # Jadwalkan laporan Dashboard Produktivitas setiap 2 jam sekali dari jam 07.00 s/d 20.00 WIB setiap hari
+        tz_wib = timezone(timedelta(hours=7))
+        dashboard_hours = [7, 9, 11, 13, 15, 17, 19, 20]
+        for h in dashboard_hours:
+            job_queue.run_daily(
+                send_scheduled_dashboard_job,
+                time=time(hour=h, minute=0, second=0, tzinfo=tz_wib),
+                name=f"auto_dashboard_{h:02d}00"
+            )
+        logger.info(f"Auto dashboard terdaftar untuk jam: {dashboard_hours} WIB ke grup {config.TARGET_GROUP_ID}")
+
+        # Recap berkas harian tetap berjalan setiap 12 jam
+        job_queue.run_repeating(run_daily_recap_job, interval=43200, first=60)
         logger.info("Job harian berhasil didaftarkan ke JobQueue.")
     else:
         logger.warning("JobQueue tidak aktif. Pastikan python-telegram-bot[job-queue] terinstall.")
@@ -892,6 +953,9 @@ def main():
     )
 
     # 8. Registrasi Handlers ke Application
+    # Blokir seluruh perintah & tombol dari anggota di dalam grup target (-1001342185601)
+    application.add_handler(TypeHandler(Update, block_group_interactions), group=-1)
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("bantuan", help_command))

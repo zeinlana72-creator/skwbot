@@ -46,6 +46,14 @@ if allowed_ids_raw:
     except ValueError:
         print("PERINGATAN: Format ALLOWED_TELEGRAM_IDS di file .env tidak valid. Harap gunakan angka dipisahkan koma.")
 
+# ID Grup Telegram untuk pengiriman laporan otomatis
+target_group_raw = os.getenv("TARGET_GROUP_ID", "-1001342185601").strip()
+try:
+    TARGET_GROUP_ID = int(target_group_raw)
+except ValueError:
+    TARGET_GROUP_ID = -1001342185601
+
+
 # Kategori Status Pekerjaan (Work Order)
 STATUS_CATEGORIES = [
     "Pending",       # Baru masuk / belum dikerjakan
