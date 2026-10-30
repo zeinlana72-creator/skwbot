@@ -242,16 +242,16 @@ class SheetsHandler:
             "pending_docs": pending_docs
         }
 
-    def get_sa_mempawah_report(self, jml_teknisi=None, kendala=None):
+    def get_singkawang_report(self, jml_teknisi=None, kendala=None):
         """
-        Menghitung laporan SA MEMPAWAH dari 4 sheet target:
+        Menghitung laporan SINGKAWANG dari 4 sheet target:
         - INSERA 22 (INSERA22)
         - sta
         - UNSPEC MPW
         - UNSPEC STA
         
-        Format output persis sesuai gambar referensi:
-        🏢 SA MEMPAWAH
+        Format output:
+        🏢 SINGKAWANG
         ___________________
         🕒 LAPORAN JAM : 12.00
 
@@ -411,7 +411,7 @@ class SheetsHandler:
 
         # Format pesan teks persis sesuai gambar yang dikirim user
         message_text = (
-            "🏢 SA MEMPAWAH\n"
+            "🏢 SINGKAWANG\n"
             "___________________\n"
             f"🕒 LAPORAN JAM : {jam_str}\n\n"
             f"👷 Jml Teknisi : {tek_str}\n"
@@ -428,4 +428,7 @@ class SheetsHandler:
             "sheet_stats": sheet_stats,
             "text": message_text
         }
+
+    # Alias untuk kompatibilitas
+    get_sa_mempawah_report = get_singkawang_report
 

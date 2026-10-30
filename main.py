@@ -62,7 +62,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         f"👋 Halo *{user.first_name}*!\n\n"
-        f"Saya adalah *MPWOK*, Asisten Operasional & Korlap Anda.\n"
+        f"Saya adalah *SINGKAWANG BOT*, Asisten Operasional & Korlap Anda.\n"
         f"Saya terhubung ke Google Sheets untuk memantau data pekerjaan teknisi lapangan.\n\n"
         f"Pilih menu di bawah ini atau ketik `/report` untuk memulai:"
     )
@@ -77,7 +77,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🤖 Tagihan Gemini AI", callback_data="menu_gemini_wo")
         ],
         [
-            InlineKeyboardButton("🏢 Laporan SA MEMPAWAH (/report)", callback_data="menu_sa_mempawah")
+            InlineKeyboardButton("🏢 Laporan SINGKAWANG (/report)", callback_data="menu_singkawang")
         ],
         [
             InlineKeyboardButton("📸 Dashboard Produktivitas (/dashboard)", callback_data="menu_dashboard")
@@ -189,7 +189,7 @@ async def handle_check_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# --- ALUR: LAPORAN & REKAP OPERASIONAL (/report, /rekap, /samempawah, dll) ---
+# --- ALUR: LAPORAN & REKAP OPERASIONAL (/report, /rekap, /singkawang, dll) ---
 
 async def show_report_help(update: Update):
     """Menampilkan panduan format penggunaan perintah /report."""
@@ -197,17 +197,17 @@ async def show_report_help(update: Update):
         "💡 *Panduan Perintah Laporan:* `/report`\n\n"
         "Perintah ini dapat digunakan secara langsung maupun dengan argumen opsional:\n\n"
         "1. `/report`\n"
-        "   Mengambil dan menampilkan laporan ringkas SA MEMPAWAH saat ini.\n\n"
+        "   Mengambil dan menampilkan laporan ringkas SINGKAWANG saat ini.\n\n"
         "2. `/report [jml_teknisi]`\n"
         "   Contoh: `/report 10`\n"
         "   Otomatis menghitung produktifitas (Close Order ÷ Jml Teknisi).\n\n"
         "3. `/report [jml_teknisi] [kendala...]`\n"
-        "   Contoh: `/report 12 Hujan deras & ODP padam di Sadaniang`\n"
+        "   Contoh: `/report 12 Hujan deras & ODP padam`\n"
         "   Menyertakan jumlah teknisi serta catatan kendala operasional.\n\n"
-        "📌 *Alias Perintah:* Anda juga bisa mengetik `/rekap`, `/laporan`, `/reaport`, atau `/samempawah`."
+        "📌 *Alias Perintah:* Anda juga bisa mengetik `/rekap`, `/laporan`, `/reaport`, atau `/singkawang`."
     )
     keyboard = [
-        [InlineKeyboardButton("🏢 Buat Laporan Sekarang", callback_data="menu_sa_mempawah")],
+        [InlineKeyboardButton("🏢 Buat Laporan Sekarang", callback_data="menu_singkawang")],
         [InlineKeyboardButton("⬅️ Kembali ke Menu", callback_data="menu_back")]
     ]
     if update.message:
@@ -216,7 +216,7 @@ async def show_report_help(update: Update):
         await update.callback_query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menangani perintah /report, /reaport, /laporan, /rekap, /samempawah."""
+    """Menangani perintah /report, /reaport, /laporan, /rekap, /singkawang."""
     user = update.effective_user
     if not is_authorized(user.id):
         await update.message.reply_text("Maaf, Anda tidak memiliki izin untuk menggunakan bot ini.")
@@ -236,14 +236,14 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kendala = " ".join(context.args[1:])
 
     # Kirim status memproses data
-    loading_msg = await update.message.reply_text("⏳ Sedang menghitung laporan SA MEMPAWAH dari sheet target...")
+    loading_msg = await update.message.reply_text("⏳ Sedang menghitung laporan SINGKAWANG dari sheet target...")
 
     try:
-        report = await asyncio.to_thread(db.get_sa_mempawah_report, jml_teknisi, kendala)
+        report = await asyncio.to_thread(db.get_singkawang_report, jml_teknisi, kendala)
         keyboard = [
             [
-                InlineKeyboardButton("📊 Rincian Per Sheet", callback_data="sa_mempawah_detail"),
-                InlineKeyboardButton("🔄 Refresh", callback_data="sa_mempawah_refresh")
+                InlineKeyboardButton("📊 Rincian Per Sheet", callback_data="singkawang_detail"),
+                InlineKeyboardButton("🔄 Refresh", callback_data="singkawang_refresh")
             ],
             [
                 InlineKeyboardButton("📋 Ringkasan WO", callback_data="report_wo_summary"),
@@ -260,20 +260,21 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await loading_msg.edit_text(f"❌ Terjadi kesalahan saat membaca data laporan:\n{e}")
 
 # Alias untuk kompatibilitas
+handle_singkawang = handle_report
 handle_sa_mempawah = handle_report
 
-async def handle_menu_sa_mempawah(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menangani klik tombol menu Laporan SA MEMPAWAH."""
+async def handle_menu_singkawang(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menangani klik tombol menu Laporan SINGKAWANG."""
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text("⏳ Sedang menghitung laporan SA MEMPAWAH...")
+    await query.edit_message_text("⏳ Sedang menghitung laporan SINGKAWANG...")
     try:
-        report = await asyncio.to_thread(db.get_sa_mempawah_report)
+        report = await asyncio.to_thread(db.get_singkawang_report)
         keyboard = [
             [
-                InlineKeyboardButton("📊 Rincian Per Sheet", callback_data="sa_mempawah_detail"),
-                InlineKeyboardButton("🔄 Refresh", callback_data="sa_mempawah_refresh")
+                InlineKeyboardButton("📊 Rincian Per Sheet", callback_data="singkawang_detail"),
+                InlineKeyboardButton("🔄 Refresh", callback_data="singkawang_refresh")
             ],
             [
                 InlineKeyboardButton("📋 Ringkasan WO", callback_data="report_wo_summary"),
@@ -290,21 +291,24 @@ async def handle_menu_sa_mempawah(update: Update, context: ContextTypes.DEFAULT_
         keyboard = [[InlineKeyboardButton("⬅️ Kembali ke Menu", callback_data="menu_back")]]
         await query.edit_message_text(f"❌ Terjadi kesalahan saat membaca data laporan:\n{e}", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def handle_sa_mempawah_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menangani tombol refresh, rincian per sheet, dan ringkasan pada laporan SA MEMPAWAH."""
+# Alias untuk callback lama
+handle_menu_sa_mempawah = handle_menu_singkawang
+
+async def handle_singkawang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menangani tombol refresh, rincian per sheet, dan ringkasan pada laporan SINGKAWANG."""
     query = update.callback_query
     await query.answer()
 
     data = query.data
-    if data == "sa_mempawah_refresh":
+    if data in ["singkawang_refresh", "sa_mempawah_refresh"]:
         # Paksa ambil data baru
         db._sa_cache = None
         db._sa_cache_time = 0
-        report = await asyncio.to_thread(db.get_sa_mempawah_report)
+        report = await asyncio.to_thread(db.get_singkawang_report)
         keyboard = [
             [
-                InlineKeyboardButton("📊 Rincian Per Sheet", callback_data="sa_mempawah_detail"),
-                InlineKeyboardButton("🔄 Refresh", callback_data="sa_mempawah_refresh")
+                InlineKeyboardButton("📊 Rincian Per Sheet", callback_data="singkawang_detail"),
+                InlineKeyboardButton("🔄 Refresh", callback_data="singkawang_refresh")
             ],
             [
                 InlineKeyboardButton("📋 Ringkasan WO", callback_data="report_wo_summary"),
@@ -316,11 +320,11 @@ async def handle_sa_mempawah_callback(update: Update, context: ContextTypes.DEFA
         ]
         await query.edit_message_text(report["text"], reply_markup=InlineKeyboardMarkup(keyboard))
 
-    elif data == "sa_mempawah_detail":
-        report = await asyncio.to_thread(db.get_sa_mempawah_report)
+    elif data in ["singkawang_detail", "sa_mempawah_detail"]:
+        report = await asyncio.to_thread(db.get_singkawang_report)
         sheet_stats = report.get("sheet_stats", {})
         
-        detail_text = "📋 *Rincian Sheet SA MEMPAWAH:*\n\n"
+        detail_text = "📋 *Rincian Sheet SINGKAWANG:*\n\n"
         for s_name, stats in sheet_stats.items():
             tot = stats.get("total", 0)
             cls = stats.get("close", 0)
@@ -331,7 +335,7 @@ async def handle_sa_mempawah_callback(update: Update, context: ContextTypes.DEFA
         
         keyboard = [
             [
-                InlineKeyboardButton("⬅️ Kembali ke Laporan", callback_data="sa_mempawah_refresh")
+                InlineKeyboardButton("⬅️ Kembali ke Laporan", callback_data="singkawang_refresh")
             ]
         ]
         await query.edit_message_text(detail_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -349,13 +353,16 @@ async def handle_sa_mempawah_callback(update: Update, context: ContextTypes.DEFA
         )
         keyboard = [
             [
-                InlineKeyboardButton("⬅️ Kembali ke Laporan", callback_data="sa_mempawah_refresh")
+                InlineKeyboardButton("⬅️ Kembali ke Laporan", callback_data="singkawang_refresh")
             ]
         ]
         await query.edit_message_text(summary_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
     elif data == "report_help_info":
         await show_report_help(update)
+
+# Alias callback lama
+handle_sa_mempawah_callback = handle_singkawang_callback
 
 # --- ALUR: DASHBOARD PRODUKTIVITAS TEKNISI (/dashboard) ---
 
@@ -389,7 +396,7 @@ async def handle_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [
                 InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="menu_dashboard"),
-                InlineKeyboardButton("🏢 Laporan SA MEMPAWAH", callback_data="menu_sa_mempawah")
+                InlineKeyboardButton("🏢 Laporan SINGKAWANG", callback_data="menu_singkawang")
             ],
             [
                 InlineKeyboardButton("⬅️ Menu Utama", callback_data="menu_back")
@@ -746,22 +753,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     help_text = (
-        "🤖 *Panduan Perintah Bot MPWOK*\n\n"
+        "🤖 *Panduan Perintah Bot SINGKAWANG*\n\n"
         "Berikut daftar perintah yang dapat Anda gunakan di bot ini:\n\n"
         "• `/start` - Menampilkan menu interaktif utama\n"
-        "• `/report` - Menampilkan laporan operasional SA MEMPAWAH\n"
+        "• `/report` - Menampilkan laporan operasional SINGKAWANG\n"
         "  _Argumen opsional:_\n"
         "  - `/report [jml_teknisi]` contoh: `/report 10`\n"
         "  - `/report [jml_teknisi] [kendala...]` contoh: `/report 12 Hujan deras di beberapa titik`\n"
         "• `/rekap` atau `/laporan` - Perintah cepat untuk laporan operasional\n"
-        "• `/samempawah` - Perintah khusus laporan SA Mempawah\n"
+        "• `/singkawang` - Perintah khusus laporan SINGKAWANG\n"
         "• `/dashboard` - Tangkapan layar tabel produktivitas teknisi & analisis rekap\n"
         "• `/help` - Menampilkan panduan bantuan ini\n\n"
         "💡 Anda juga dapat mengklik tombol pada menu utama `/start` untuk mengelola WO, memperbarui status, dan menyusun pesan tagihan otomatis."
     )
     keyboard = [
         [
-            InlineKeyboardButton("🏢 Laporan SA MEMPAWAH", callback_data="menu_sa_mempawah"),
+            InlineKeyboardButton("🏢 Laporan SINGKAWANG", callback_data="menu_singkawang"),
             InlineKeyboardButton("📸 Dashboard Produktivitas", callback_data="menu_dashboard")
         ],
         [InlineKeyboardButton("📱 Menu Utama", callback_data="menu_back")]
@@ -772,11 +779,11 @@ async def post_init(application):
     """Mendaftarkan menu perintah (Bot Commands) ke aplikasi Telegram."""
     commands = [
         BotCommand("start", "Mulai bot & menu utama"),
-        BotCommand("report", "Laporan SA MEMPAWAH (/report [teknisi] [kendala])"),
+        BotCommand("report", "Laporan SINGKAWANG (/report [teknisi] [kendala])"),
+        BotCommand("singkawang", "Laporan SINGKAWANG"),
         BotCommand("dashboard", "Screenshot dashboard & rekap teknisi"),
         BotCommand("laporan", "Laporan operasional & tiket"),
         BotCommand("rekap", "Rekapitulasi berkas & order"),
-        BotCommand("samempawah", "Laporan SA MEMPAWAH"),
         BotCommand("help", "Panduan dan bantuan penggunaan bot")
     ]
     try:
@@ -897,7 +904,7 @@ def main():
 
     # Perintah Laporan / Report (dengan berbagai alias & variasi penulisan)
     application.add_handler(CommandHandler(
-        ["report", "reaport", "laporan", "rekap", "SAMEMPAWAH", "samempawah"],
+        ["report", "reaport", "laporan", "rekap", "SINGKAWANG", "singkawang", "sasingkawang", "SAMEMPAWAH", "samempawah"],
         handle_report
     ))
     
@@ -907,14 +914,14 @@ def main():
     
     # Handler Menu Utama Non-percakapan
     application.add_handler(CallbackQueryHandler(handle_list_wo, pattern="^menu_list_wo$"))
-    application.add_handler(CallbackQueryHandler(handle_menu_sa_mempawah, pattern="^menu_sa_mempawah$"))
-    application.add_handler(CallbackQueryHandler(handle_sa_mempawah_callback, pattern="^(sa_mempawah_|report_)"))
+    application.add_handler(CallbackQueryHandler(handle_menu_singkawang, pattern="^(menu_singkawang|menu_sa_mempawah)$"))
+    application.add_handler(CallbackQueryHandler(handle_singkawang_callback, pattern="^(singkawang_|sa_mempawah_|report_)"))
     application.add_handler(CallbackQueryHandler(handle_dashboard, pattern="^menu_dashboard$"))
     application.add_handler(CallbackQueryHandler(handle_check_docs, pattern="^menu_check_docs$"))
     application.add_handler(CallbackQueryHandler(handle_menu_back, pattern="^menu_back$"))
 
     # 9. Jalankan Bot
-    print("🚀 Bot MPWOK sedang berjalan... Tekan Ctrl+C untuk menghentikan.")
+    print("🚀 Bot SINGKAWANG sedang berjalan... Tekan Ctrl+C untuk menghentikan.")
     application.run_polling()
 
 if __name__ == "__main__":

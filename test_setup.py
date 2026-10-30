@@ -9,7 +9,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 def test_connectivity():
     print("==================================================")
-    print("🔍 MEMULAI VERIFIKASI PENGATURAN BOT MPWOK")
+    print("🔍 MEMULAI VERIFIKASI PENGATURAN BOT SINGKAWANG")
     print("==================================================")
 
     # 1. Cek file .env
@@ -58,17 +58,17 @@ def test_connectivity():
         print(f"   c. Pastikan GOOGLE_SHEET_ID '{config.GOOGLE_SHEET_ID}' benar.")
         return False
 
-    # 4. Tes Laporan SA MEMPAWAH (/report)
-    print("\n3. Menguji Perhitungan Laporan SA MEMPAWAH (/report)...")
+    # 4. Tes Laporan SINGKAWANG (/report)
+    print("\n3. Menguji Perhitungan Laporan SINGKAWANG (/report)...")
     try:
-        report = db.get_sa_mempawah_report(jml_teknisi=10, kendala="Semua aman terkendali")
+        report = db.get_singkawang_report(jml_teknisi=10, kendala="Semua aman terkendali")
         print("✅ PERHITUNGAN LAPORAN BERHASIL!")
         print("📝 Tampilan Laporan:")
         print("--------------------------------------------------")
         print(report["text"])
         print("--------------------------------------------------")
     except Exception as e:
-        print(f"❌ Gagal menghitung laporan SA MEMPAWAH: {e}")
+        print(f"❌ Gagal menghitung laporan SINGKAWANG: {e}")
 
     # 5. Tes koneksi Gemini AI
     print("\n4. Menguji Koneksi Gemini AI...")
