@@ -32,6 +32,16 @@ from telegram.ext import (
 import config
 from sheets_handler import SheetsHandler
 from dashboard_capture import capture_productivity_dashboard
+from mybranch_capture import (
+    MyBranchAuthNeeded,
+    capture_absen_assurance,
+    get_pending_auth_step,
+    initiate_tactical_login,
+    submit_manual_captcha,
+    submit_otp_code,
+    clear_pending_auth,
+    keepalive_mybranch_session,
+)
 
 # Konfigurasi Logging
 logging.basicConfig(
@@ -64,11 +74,11 @@ def is_authorized(user_id: int) -> bool:
 
 async def block_group_interactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Memastikan anggota grup TARGET_GROUP_ID (-1001342185601)
+    Memastikan anggota grup TARGET_GROUP_ID dan REPORT_GROUP_ID
     tidak dapat melakukan perintah apapun di dalam grup.
     """
     chat = update.effective_chat
-    if chat and chat.id == config.TARGET_GROUP_ID:
+    if chat and chat.id in (config.TARGET_GROUP_ID, config.REPORT_GROUP_ID):
         # Jika ada perintah teks (seperti /start, /report, /dashboard, dll) dari anggota grup
         if update.message and update.message.text and update.message.text.startswith("/"):
             raise ApplicationHandlerStop
@@ -107,6 +117,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("📸 Dashboard Produktivitas (/dashboard)", callback_data="menu_dashboard")
+        ],
+        [
+            InlineKeyboardButton("📋 Absen Assurance Singkawang (/absen_assurance)", callback_data="menu_absen_assurance")
         ],
         [
             InlineKeyboardButton("⏰ Cek Berkas Pending", callback_data="menu_check_docs")
@@ -266,6 +279,11 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         report = await asyncio.to_thread(db.get_singkawang_report, jml_teknisi, kendala)
+        # Kirim hasil laporan ke grup REPORT_GROUP_ID (-1003737866244)
+        await context.bot.send_message(
+            chat_id=config.REPORT_GROUP_ID,
+            text=report["text"]
+        )
         keyboard = [
             [
                 InlineKeyboardButton("📊 Rincian Per Sheet", callback_data="singkawang_detail"),
@@ -280,21 +298,24 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await loading_msg.edit_text(report["text"], reply_markup=reply_markup)
+        await loading_msg.edit_text(
+            f"✅ *Laporan berhasil dikirimkan ke grup (`{config.REPORT_GROUP_ID}`)!*\n\n{report['text']}",
+            reply_markup=reply_markup
+        )
     except Exception as e:
         logger.error(f"Gagal memproses laporan: {e}")
-        await loading_msg.edit_text(f"❌ Terjadi kesalahan saat membaca data laporan:\n{e}")
+        await loading_msg.edit_text(f"❌ Terjadi kesalahan saat membaca/mengirim data laporan:\n{e}")
 
 # Alias untuk kompatibilitas
 handle_singkawang = handle_report
 handle_sa_mempawah = handle_report
 
 async def handle_menu_singkawang(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menangani klik tombol menu Laporan SINGKAWANG."""
+    """Menangani klik tombol menu Laporan SINGKAWANG dan mengirim hasilnya ke grup report."""
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text("⏳ Sedang menghitung laporan SINGKAWANG...")
+    await query.edit_message_text("⏳ Sedang menghitung & mengirim laporan SINGKAWANG ke grup...")
     try:
         report = await asyncio.to_thread(db.get_singkawang_report)
         keyboard = [
@@ -311,11 +332,20 @@ async def handle_menu_singkawang(update: Update, context: ContextTypes.DEFAULT_T
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(report["text"], reply_markup=reply_markup)
+        target_group_id = getattr(config, "REPORT_GROUP_ID", config.TARGET_GROUP_ID)
+        await context.bot.send_message(
+            chat_id=target_group_id,
+            text=report["text"]
+        )
+        await query.edit_message_text(
+            f"✅ *Laporan SINGKAWANG berhasil dikirim ke grup* (`{target_group_id}`)!\n\n{report['text']}",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
     except Exception as e:
         logger.error(f"Gagal memproses laporan: {e}")
         keyboard = [[InlineKeyboardButton("⬅️ Kembali ke Menu", callback_data="menu_back")]]
-        await query.edit_message_text(f"❌ Terjadi kesalahan saat membaca data laporan:\n{e}", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(f"❌ Terjadi kesalahan saat membaca/mengirim data laporan:\n{e}", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # Alias untuk callback lama
 handle_menu_sa_mempawah = handle_menu_singkawang
@@ -403,6 +433,7 @@ async def handle_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+    context.user_data.clear()
     if update.callback_query:
         await update.callback_query.answer()
         status_msg = await update.callback_query.message.reply_text(
@@ -419,9 +450,30 @@ async def handle_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_file = io.BytesIO(screenshot_bytes)
         photo_file.name = "dashboard_produktivitas.png"
 
+        target_group_id = config.REPORT_GROUP_ID
+
+        # Kirim hasil ke grup REPORT_GROUP_ID (-1003737866244) tanpa tombol
+        if len(desc) <= 1024:
+            await context.bot.send_photo(
+                chat_id=target_group_id,
+                photo=photo_file,
+                caption=desc,
+                parse_mode="Markdown"
+            )
+        else:
+            await context.bot.send_photo(
+                chat_id=target_group_id,
+                photo=photo_file
+            )
+            await context.bot.send_message(
+                chat_id=target_group_id,
+                text=desc,
+                parse_mode="Markdown"
+            )
+
         keyboard = [
             [
-                InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="menu_dashboard"),
+                InlineKeyboardButton("🔄 Kirim Ulang Dashboard", callback_data="menu_dashboard"),
                 InlineKeyboardButton("🏢 Laporan SINGKAWANG", callback_data="menu_singkawang")
             ],
             [
@@ -430,29 +482,11 @@ async def handle_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        # Caption batas 1024 karakter di Telegram
-        if len(desc) <= 1024:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=photo_file,
-                caption=desc,
-                parse_mode="Markdown",
-                reply_markup=reply_markup
-            )
-        else:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=photo_file
-            )
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=desc,
-                parse_mode="Markdown",
-                reply_markup=reply_markup
-            )
-
+        confirm_msg = f"✅ *Laporan Dashboard Produktivitas berhasil dikirimkan ke grup (`{target_group_id}`)!*"
         if status_msg:
-            await status_msg.delete()
+            await status_msg.edit_text(confirm_msg, parse_mode="Markdown", reply_markup=reply_markup)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=confirm_msg, parse_mode="Markdown", reply_markup=reply_markup)
 
     except Exception as e:
         logger.error(f"Gagal memproses dashboard capture: {e}", exc_info=True)
@@ -461,6 +495,191 @@ async def handle_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text(err_msg, parse_mode="Markdown")
         else:
             await context.bot.send_message(chat_id=chat_id, text=err_msg, parse_mode="Markdown")
+
+# --- ALUR: ABSEN ASSURANCE SINGKAWANG (/absen_assurance) ---
+
+async def _send_mybranch_auth_prompt(context: ContextTypes.DEFAULT_TYPE, requester_chat_id: int, status_msg=None):
+    """Memulai login Tactical MyBranch dan mengirimkan permintaan OTP (atau Captcha) ke Telegram user."""
+    logger.info(f"Memulai login MyBranch untuk requester_chat_id={requester_chat_id}")
+    try:
+        res = await asyncio.to_thread(initiate_tactical_login, requester_chat_id)
+        step = res.get("step")
+
+        if step == "otp":
+            otp_prompt = (
+                f"🔐 *Verifikasi Login MyBranch (takalbagbar.id)*\n\n"
+                f"✅ Login akun Tactical `{config.MYBRANCH_NIK}` berhasil melewati Captcha!\n"
+                f"Kode OTP baru saja dikirim ke Telegram Anda (Telkom Akses).\n\n"
+                f"👉 *Silakan ketik/balas langsung 6 digit kode OTP tersebut di sini:*"
+            )
+            if status_msg:
+                await status_msg.edit_text(otp_prompt, parse_mode="Markdown")
+            else:
+                await context.bot.send_message(chat_id=requester_chat_id, text=otp_prompt, parse_mode="Markdown")
+
+        elif step == "captcha":
+            captcha_photo = io.BytesIO(res["captcha_bytes"])
+            captcha_photo.name = "captcha_mybranch.jpg"
+            caption = (
+                f"🔤 *Langkah 1/2: Captcha Login MyBranch*\n"
+                f"Akun Tactical: `{config.MYBRANCH_NIK}`\n\n"
+                f"👉 *Silakan ketik 3 huruf Captcha pada gambar di atas* (lalu pada langkah berikutnya bot akan meminta kode OTP Telegram Anda):"
+            )
+            await context.bot.send_photo(
+                chat_id=requester_chat_id,
+                photo=captcha_photo,
+                caption=caption,
+                parse_mode="Markdown"
+            )
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"Gagal memulai login MyBranch: {e}", exc_info=True)
+        err_text = f"❌ Gagal menghubungi server login `takalbagbar.id/mybranch`:\n`{e}`"
+        if status_msg:
+            await status_msg.edit_text(err_text, parse_mode="Markdown")
+        else:
+            await context.bot.send_message(chat_id=requester_chat_id, text=err_text, parse_mode="Markdown")
+
+
+async def _deliver_absen_assurance_photo(context: ContextTypes.DEFAULT_TYPE, chat_id: int, status_msg=None):
+    """Mengambil screenshot Absen Assurance Singkawang dan mengirimkannya ke grup REPORT_GROUP_ID (-1003737866244)."""
+    screenshot_bytes, caption = await capture_absen_assurance()
+    photo_file = io.BytesIO(screenshot_bytes)
+    photo_file.name = "absen_assurance_singkawang.png"
+
+    target_group_id = config.REPORT_GROUP_ID
+
+    # Kirim hasil tangkapan layar & laporan langsung ke grup target (-1003737866244) tanpa tombol menu
+    if len(caption) <= 1024:
+        await context.bot.send_photo(
+            chat_id=target_group_id,
+            photo=photo_file,
+            caption=caption,
+            parse_mode="Markdown"
+        )
+    else:
+        await context.bot.send_photo(
+            chat_id=target_group_id,
+            photo=photo_file
+        )
+        await context.bot.send_message(
+            chat_id=target_group_id,
+            text=caption,
+            parse_mode="Markdown"
+        )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Kirim Ulang Absen", callback_data="menu_absen_assurance"),
+            InlineKeyboardButton("📸 Dashboard Produktivitas", callback_data="menu_dashboard")
+        ],
+        [
+            InlineKeyboardButton("⬅️ Menu Utama", callback_data="menu_back")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    confirm_text = (
+        f"✅ *Laporan Absen Assurance (Singkawang) berhasil dikirimkan ke grup (`{target_group_id}`)!*"
+    )
+    if status_msg:
+        await status_msg.edit_text(confirm_text, parse_mode="Markdown", reply_markup=reply_markup)
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=confirm_text, parse_mode="Markdown", reply_markup=reply_markup)
+
+
+async def handle_absen_assurance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menangani perintah /absen_assurance untuk tangkapan layar dashboard Absen Assurance Singkawang."""
+    user = update.effective_user
+    if not is_authorized(user.id):
+        if update.message:
+            await update.message.reply_text("Maaf, Anda tidak memiliki izin untuk menggunakan bot ini.")
+        elif update.callback_query:
+            await update.callback_query.answer("Akses ditolak.", show_alert=True)
+        return
+
+    chat_id = update.effective_chat.id
+    context.user_data.clear()
+    if update.callback_query:
+        await update.callback_query.answer()
+        status_msg = await update.callback_query.message.reply_text(
+            "⏳ Sedang membuka dashboard *Absen Assurance (Singkawang)* di `takalbagbar.id/mybranch`...\n_(Membutuhkan beberapa detik)_",
+            parse_mode="Markdown"
+        )
+    else:
+        status_msg = await update.message.reply_text(
+            "⏳ Sedang membuka dashboard *Absen Assurance (Singkawang)* di `takalbagbar.id/mybranch`...\n_(Membutuhkan beberapa detik)_",
+            parse_mode="Markdown"
+        )
+
+    try:
+        await _deliver_absen_assurance_photo(context, chat_id, status_msg)
+    except MyBranchAuthNeeded:
+        await status_msg.edit_text(
+            "🔐 Sesi login MyBranch belum aktif atau telah kedaluwarsa. Memulai proses login Tactical & meminta OTP..."
+        )
+        await _send_mybranch_auth_prompt(context, chat_id, status_msg)
+    except Exception as e:
+        logger.error(f"Gagal memproses absen_assurance: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Terjadi kesalahan saat mengambil Absen Assurance:\n`{e}`", parse_mode="Markdown")
+
+
+async def handle_mybranch_auth_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menangani balasan kode Captcha atau kode OTP Tactical dari chat Telegram."""
+    if not update.message or not update.message.text:
+        return
+    step = get_pending_auth_step()
+    if not step:
+        return
+
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+
+    if step == "captcha":
+        wait_msg = await update.message.reply_text("⏳ Memverifikasi Captcha & meminta OTP Tactical ke server...")
+        res = await asyncio.to_thread(submit_manual_captcha, text)
+        if res.get("ok") and res.get("step") == "otp":
+            await wait_msg.edit_text(
+                "🔐 *Langkah 2/2: Kode OTP Tactical*\n\n"
+                "✅ Captcha berhasil diverifikasi! Kode OTP baru saja dikirim ke Telegram Anda.\n\n"
+                "👉 *Silakan balas/ketik kode OTP tersebut di sini:*",
+                parse_mode="Markdown"
+            )
+        else:
+            await wait_msg.edit_text(f"⚠️ {res.get('message', 'Captcha salah.')}\nMengambil Captcha baru...")
+            await _send_mybranch_auth_prompt(context, chat_id, wait_msg)
+        raise ApplicationHandlerStop
+
+    elif step == "otp":
+        wait_msg = await update.message.reply_text("⏳ Memverifikasi kode OTP Tactical ke `takalbagbar.id/mybranch`...", parse_mode="Markdown")
+        res = await asyncio.to_thread(submit_otp_code, text)
+        if res.get("ok"):
+            target_chat_id = res.get("target_chat_id") or chat_id
+            await wait_msg.edit_text(
+                "✅ *Login MyBranch Berhasil!* Sesi telah disimpan.\n"
+                "⏳ Sedang mengambil tangkapan layar *Absen Assurance (Singkawang)*...",
+                parse_mode="Markdown"
+            )
+            try:
+                await _deliver_absen_assurance_photo(context, target_chat_id, wait_msg)
+            except Exception as e:
+                logger.error(f"Gagal capture setelah login OTP: {e}", exc_info=True)
+                await wait_msg.edit_text(f"❌ Login berhasil, namun gagal mengambil tangkapan layar:\n`{e}`", parse_mode="Markdown")
+        else:
+            msg = res.get("message", "Kode OTP salah atau kedaluwarsa.")
+            if res.get("need_restart"):
+                await wait_msg.edit_text(f"❌ {msg}\nMengulang permintaan login baru...")
+                await _send_mybranch_auth_prompt(context, chat_id, wait_msg)
+            else:
+                await wait_msg.edit_text(
+                    f"❌ *{msg}*\nSilakan ketik ulang kode OTP yang benar (atau ketik `/absen_assurance` untuk meminta OTP baru):",
+                    parse_mode="Markdown"
+                )
+        raise ApplicationHandlerStop
 
 # --- ALUR PERCAKAPAN: UPDATE STATUS WO ---
 
@@ -824,6 +1043,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/rekap` atau `/laporan` - Perintah cepat untuk laporan operasional\n"
         "• `/singkawang` - Perintah khusus laporan SINGKAWANG\n"
         "• `/dashboard` - Tangkapan layar tabel produktivitas teknisi & analisis rekap\n"
+        "• `/absen_assurance` - Tangkapan layar dashboard Absen Assurance (Singkawang)\n"
         "• `/help` - Menampilkan panduan bantuan ini\n\n"
         "💡 Anda juga dapat mengklik tombol pada menu utama `/start` untuk mengelola WO, memperbarui status, dan menyusun pesan tagihan otomatis."
     )
@@ -843,6 +1063,7 @@ async def post_init(application):
         BotCommand("report", "Laporan SINGKAWANG (/report [teknisi] [kendala])"),
         BotCommand("singkawang", "Laporan SINGKAWANG"),
         BotCommand("dashboard", "Screenshot dashboard & rekap teknisi"),
+        BotCommand("absen_assurance", "Screenshot dashboard Absen Assurance Singkawang"),
         BotCommand("laporan", "Laporan operasional & tiket"),
         BotCommand("rekap", "Rekapitulasi berkas & order"),
         BotCommand("help", "Panduan dan bantuan penggunaan bot")
@@ -851,10 +1072,11 @@ async def post_init(application):
         # Hapus seluruh tombol perintah (/) di seluruh grup dan khusus grup target
         await application.bot.delete_my_commands(scope=BotCommandScopeDefault())
         await application.bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
-        try:
-            await application.bot.delete_my_commands(scope=BotCommandScopeChat(config.TARGET_GROUP_ID))
-        except Exception:
-            pass
+        for gid in {config.TARGET_GROUP_ID, getattr(config, "REPORT_GROUP_ID", config.TARGET_GROUP_ID)}:
+            try:
+                await application.bot.delete_my_commands(scope=BotCommandScopeChat(gid))
+            except Exception:
+                pass
 
         # Daftarkan tombol perintah (/) HANYA di chat pribadi (DM)
         await application.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
@@ -923,6 +1145,13 @@ def main():
         # Recap berkas harian tetap berjalan setiap 12 jam
         job_queue.run_repeating(run_daily_recap_job, interval=43200, first=60)
         logger.info("Job harian berhasil didaftarkan ke JobQueue.")
+
+        # Keep-Alive sesi login MyBranch setiap 10 menit (600 detik) agar sesi tidak kadaluarsa karena idle
+        async def _run_mybranch_keepalive(context: ContextTypes.DEFAULT_TYPE):
+            await asyncio.to_thread(keepalive_mybranch_session)
+
+        job_queue.run_repeating(_run_mybranch_keepalive, interval=600, first=120, name="mybranch_keepalive")
+        logger.info("Job Keep-Alive sesi MyBranch (setiap 10 menit) berhasil didaftarkan.")
     else:
         logger.warning("JobQueue tidak aktif. Pastikan python-telegram-bot[job-queue] terinstall.")
 
@@ -984,6 +1213,15 @@ def main():
         handle_dashboard
     ))
 
+    # Perintah Dashboard Absen Assurance Singkawang
+    application.add_handler(CommandHandler(
+        ["absen_assurance", "absen"],
+        handle_absen_assurance
+    ))
+
+    # Handler input kode OTP / Captcha MyBranch di chat pribadi (group=-2 agar dieksekusi sebelum handler lainnya)
+    application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_mybranch_auth_input), group=-2)
+
     # Perintah Laporan / Report (dengan berbagai alias & variasi penulisan)
     application.add_handler(CommandHandler(
         ["report", "reaport", "laporan", "rekap", "SINGKAWANG", "singkawang", "sasingkawang", "SAMEMPAWAH", "samempawah"],
@@ -999,6 +1237,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_menu_singkawang, pattern="^(menu_singkawang|menu_sa_mempawah)$"))
     application.add_handler(CallbackQueryHandler(handle_singkawang_callback, pattern="^(singkawang_|sa_mempawah_|report_)"))
     application.add_handler(CallbackQueryHandler(handle_dashboard, pattern="^menu_dashboard$"))
+    application.add_handler(CallbackQueryHandler(handle_absen_assurance, pattern="^menu_absen_assurance$"))
     application.add_handler(CallbackQueryHandler(handle_check_docs, pattern="^menu_check_docs$"))
     application.add_handler(CallbackQueryHandler(handle_menu_back, pattern="^menu_back$"))
 

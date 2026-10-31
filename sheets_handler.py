@@ -1,6 +1,9 @@
 import logging
 import time
 import json
+import csv
+import io
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
 import gspread
@@ -11,11 +14,15 @@ import config
 # Setup logger
 logger = logging.getLogger(__name__)
 
+DEFAULT_DATANEW_APPS_SCRIPT = "https://script.google.com/macros/s/AKfycbwsleRWZLr24S6AT-cSG0CstUeSl8xIA3ssnSsZ-Hf3c50ep_ko07G-qxMrs35yqUoAvQ/exec"
+
+
 class SheetsHandler:
     def __init__(self):
         self.client = None
         self.sheet = None
         self.worksheet = None
+        self.apps_script_connected = False
         self.gemini_configured = False
         self._sa_cache = None
         self._sa_cache_time = 0
@@ -29,8 +36,48 @@ class SheetsHandler:
             except Exception as e:
                 logger.error(f"Gagal mengonfigurasi Gemini AI: {e}")
 
+    def _get_datanew_callback_url(self) -> str:
+        base_url = (config.WEB_APP_URL or DEFAULT_DATANEW_APPS_SCRIPT).strip()
+        if "AKfycbwsleRWZLr24S6AT" not in base_url:
+            base_url = DEFAULT_DATANEW_APPS_SCRIPT
+        if base_url.endswith("/exec"):
+            return base_url[:-5] + "/callback?nocache_id=1"
+        return base_url
+
+    def _call_datanew_apps_script(self, func_name: str, args_list: list):
+        """Memanggil fungsi Apps Script (getInitialData / getDetail) yang terhubung ke sheet DATANEW."""
+        url = self._get_datanew_callback_url()
+        payload = json.dumps([func_name, json.dumps(args_list), None, [0], None, None, 1, 0])
+        data = urllib.parse.urlencode({"request": payload}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+                "X-Same-Domain": "1",
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw_text = resp.read().decode("utf-8")
+        lines = raw_text.split("\n", 1)
+        body = lines[1] if len(lines) > 1 else lines[0]
+        parsed = json.loads(body)
+        return json.loads(parsed[0][1][1])
+
+    def _find_target_worksheet(self, sh):
+        """Mencari worksheet sesuai config.SHEET_NAME (default: DATANEW)."""
+        target_name = (config.SHEET_NAME or "DATANEW").strip()
+        try:
+            return sh.worksheet(target_name)
+        except Exception:
+            for ws in sh.worksheets():
+                if ws.title.strip().lower() == target_name.lower():
+                    return ws
+            return sh.get_worksheet(0)
+
     def connect(self):
-        """Menghubungkan ke Google Sheets API menggunakan file Service Account Credentials."""
+        """Menghubungkan ke Google Sheets API (prioritas gspread, fallback ke Apps Script DATANEW)."""
         try:
             scopes = [
                 "https://www.googleapis.com/auth/spreadsheets",
@@ -41,50 +88,159 @@ class SheetsHandler:
             
             # Buka Spreadsheet menggunakan ID
             self.sheet = self.client.open_by_key(config.GOOGLE_SHEET_ID)
-            
-            # Gunakan worksheet pertama (index 0)
-            self.worksheet = self.sheet.get_worksheet(0)
-            logger.info(f"Berhasil terhubung ke Google Sheet: {self.sheet.title}")
+            self.worksheet = self._find_target_worksheet(self.sheet)
+            logger.info(f"Berhasil terhubung ke Google Sheet: {self.sheet.title} (Sheet: {self.worksheet.title})")
             return True
         except Exception as e:
-            logger.error(f"Gagal terhubung ke Google Sheets: {e}")
+            logger.warning(f"Koneksi langsung gspread ke {config.GOOGLE_SHEET_ID} belum diizinkan ({e}). Menggunakan jalur Apps Script DATANEW...")
+            try:
+                init_data = self._call_datanew_apps_script("getInitialData", [])
+                if init_data and "dashboard" in init_data:
+                    self.apps_script_connected = True
+                    logger.info(f"Berhasil terhubung ke sheet {config.SHEET_NAME} via Apps Script (Tanggal: {init_data.get('selectedDate')}).")
+                    return True
+            except Exception as e2:
+                logger.error(f"Gagal terhubung ke Google Sheets maupun Apps Script DATANEW: {e2}")
             return False
 
     def _ensure_connection(self):
         """Memastikan koneksi aktif sebelum melakukan operasi."""
-        if not self.worksheet:
+        if not self.worksheet and not self.apps_script_connected:
             return self.connect()
         return True
 
+    @staticmethod
+    def _normalize_datanew_row(raw_dict: dict, row_num: int) -> dict:
+        """Menyelaraskan kolom sheet DATANEW ke format internal WO bot."""
+        upper_map = {str(k).strip().upper(): str(v).strip() for k, v in raw_dict.items() if k is not None}
+
+        wo_id = (
+            raw_dict.get("WO ID")
+            or raw_dict.get("incident")
+            or upper_map.get("INCIDENT")
+            or upper_map.get("NO INCIDENT")
+            or upper_map.get("WO ID")
+            or ""
+        ).strip()
+        tanggal = (
+            raw_dict.get("Tanggal")
+            or raw_dict.get("tanggal")
+            or upper_map.get("TANGGAL")
+            or upper_map.get("REPORTED DATE")
+            or ""
+        ).strip()
+        teknisi = (
+            raw_dict.get("Teknisi")
+            or raw_dict.get("teknisi")
+            or upper_map.get("TEKNISI")
+            or upper_map.get("TEAM")
+            or ""
+        ).strip()
+        workzone = (raw_dict.get("workzone") or upper_map.get("WORKZONE") or "").strip()
+        sektor = (raw_dict.get("sektor") or upper_map.get("SEKTOR") or "").strip()
+        cust_type = (raw_dict.get("customerType") or upper_map.get("CUSTOMER TYPE") or upper_map.get("CUST TYPE") or "").strip()
+        pelanggan = (
+            raw_dict.get("Pelanggan")
+            or " / ".join([p for p in [workzone, sektor, cust_type] if p and p != "-"])
+            or "-"
+        )
+        symptom = (raw_dict.get("symptom") or upper_map.get("SYMPTOM") or "").strip()
+        red_st = (raw_dict.get("red") or upper_map.get("RED") or "").strip()
+        pekerjaan = (
+            raw_dict.get("Pekerjaan")
+            or " - ".join([p for p in [symptom, red_st] if p and p != "-"])
+            or "-"
+        )
+        close_flag = (
+            raw_dict.get("close")
+            or upper_map.get("CLOSE/UPDATE")
+            or upper_map.get("CLOSE")
+            or upper_map.get("STATUS")
+            or ""
+        ).strip().upper()
+
+        if close_flag in ["CLOSE", "CLOSED", "COMPLETE PS", "SELESAI", "BERHENTI BERLANGGANAN"]:
+            status_norm = "Selesai"
+            berkas_norm = "Lengkap"
+        elif close_flag == "UPDATE":
+            status_norm = "Dalam Proses"
+            berkas_norm = "Belum Lengkap"
+        elif raw_dict.get("Status") in ["Pending", "Dalam Proses", "Selesai", "Tertagih"]:
+            status_norm = raw_dict["Status"]
+            berkas_norm = raw_dict.get("Kelengkapan Berkas", "")
+        else:
+            status_norm = "Pending"
+            berkas_norm = "Belum Lengkap"
+
+        keterangan = (
+            raw_dict.get("Keterangan")
+            or raw_dict.get("perbaikan")
+            or upper_map.get("PERBAIKAN")
+            or upper_map.get("KETERANGAN")
+            or ""
+        ).strip()
+
+        normalized = dict(raw_dict)
+        normalized.update({
+            "WO ID": wo_id,
+            "Tanggal": tanggal,
+            "Teknisi": teknisi,
+            "Pelanggan": pelanggan,
+            "Pekerjaan": pekerjaan,
+            "Status": status_norm,
+            "Keterangan": keterangan,
+            "Kelengkapan Berkas": berkas_norm,
+            "_close_raw": close_flag or "OPEN",
+            "_symptom_raw": symptom or "REGULER",
+            "_workzone_raw": workzone or "SNW",
+            "_row_num": row_num,
+        })
+        return normalized
+
     def get_all_wos(self):
-        """Mengambil seluruh data Work Order (WO) beserta nomor barisnya."""
+        """Mengambil seluruh data Work Order (WO) dari sheet DATANEW beserta nomor barisnya."""
         if not self._ensure_connection():
-            raise ConnectionError("Gagal terhubung ke database Google Sheets.")
+            raise ConnectionError("Gagal terhubung ke database Google Sheets (DATANEW).")
         
+        # 1. Jika terhubung langsung via gspread
+        if self.worksheet is not None:
+            try:
+                rows = self.worksheet.get_all_values()
+                if not rows:
+                    return []
+                
+                headers = [h.strip() for h in rows[0]]
+                wos = []
+                
+                for idx, row in enumerate(rows[1:], start=2):
+                    if not any(cell.strip() for cell in row):
+                        continue
+                    row_dict = {}
+                    for col_idx, header in enumerate(headers):
+                        if not header:
+                            continue
+                        val = row[col_idx] if col_idx < len(row) else ""
+                        row_dict[header] = val.strip()
+                    
+                    wos.append(self._normalize_datanew_row(row_dict, idx))
+                    
+                return wos
+            except Exception as e:
+                logger.warning(f"Gagal mengambil data WO via gspread: {e}. Mencoba jalur Apps Script DATANEW...")
+
+        # 2. Fallback via Apps Script DATANEW
         try:
-            # Ambil semua baris data
-            rows = self.worksheet.get_all_values()
-            if not rows:
-                return []
-            
-            headers = [h.strip() for h in rows[0]]
+            init_data = self._call_datanew_apps_script("getInitialData", [])
+            selected_date = init_data.get("selectedDate", "")
+            detail_data = self._call_datanew_apps_script("getDetail", [selected_date, {}])
+            detail_rows = detail_data.get("rows", [])
             wos = []
-            
-            # Mulai dari baris ke-2 (indeks 1)
-            for idx, row in enumerate(rows[1:], start=2):
-                # Buat dictionary data dan sesuaikan panjang kolom jika baris tidak lengkap
-                row_dict = {}
-                for col_idx, header in enumerate(headers):
-                    val = row[col_idx] if col_idx < len(row) else ""
-                    row_dict[header] = val.strip()
-                
-                # Tambahkan metadata nomor baris untuk mempermudah update
-                row_dict["_row_num"] = idx
-                wos.append(row_dict)
-                
+            for idx, r in enumerate(detail_rows, start=2):
+                r_num = int(r.get("rowNumber") or idx)
+                wos.append(self._normalize_datanew_row(r, r_num))
             return wos
         except Exception as e:
-            logger.error(f"Gagal mengambil data WO: {e}")
+            logger.error(f"Gagal mengambil data WO dari DATANEW: {e}")
             return []
 
     def get_wo_by_id(self, wo_id):
@@ -244,11 +400,8 @@ class SheetsHandler:
 
     def get_singkawang_report(self, jml_teknisi=None, kendala=None):
         """
-        Menghitung laporan SINGKAWANG dari 4 sheet target:
-        - INSERA 22 (INSERA22)
-        - sta
-        - UNSPEC MPW
-        - UNSPEC STA
+        Menghitung laporan SINGKAWANG dari sheet DATANEW
+        pada spreadsheet 1PrM2fyGxEWFno6WDFZVigO771yELsU3zRyrPfzO-8oQ.
         
         Format output:
         🏢 SINGKAWANG
@@ -256,8 +409,8 @@ class SheetsHandler:
         🕒 LAPORAN JAM : 12.00
 
         👷 Jml Teknisi : 
-        🎫 Saldo tiket & unspec : 173 Order
-        ✅ Close tiket & unspec : 24 Order
+        🎫 Saldo tiket & unspec : 58 Order
+        ✅ Close tiket & unspec : 45 Order
         📊 Produktifitas : 
 
         • 
@@ -274,103 +427,93 @@ class SheetsHandler:
             grand_close = self._sa_cache.get("close", 0)
         else:
             fetched_via_gspread = False
-            # 1. Prioritaskan pembacaan langsung dari Google Sheets via gspread
-            if self._ensure_connection():
+            target_sheet_name = (config.SHEET_NAME or "DATANEW").strip()
+
+            # 1. Prioritaskan pembacaan langsung dari worksheet DATANEW via gspread
+            if self._ensure_connection() and self.worksheet is not None:
                 try:
-                    all_worksheets = self.sheet.worksheets()
-                    target_map = {
-                        "insera": ["insera 22", "insera22", "insera"],
-                        "sta": ["sta"],
-                        "unspec_mpw": ["unspec mpw", "undsepc mpw", "unspac mpw"],
-                        "unspec_sta": ["unspec sta", "undsepc sta", "unspac sta"]
-                    }
+                    ws = self._find_target_worksheet(self.sheet) if self.sheet else self.worksheet
+                    rows = ws.get_all_values()
+                    if rows and len(rows) > 1:
+                        headers = [str(h).strip().upper() for h in rows[0]]
+                        close_idx = -1
+                        for candidate in ["CLOSE/UPDATE", "CLOSE", "STATUS", "GROUPING", "STATE"]:
+                            if candidate in headers:
+                                close_idx = headers.index(candidate)
+                                break
+                        symptom_idx = headers.index("SYMPTOM") if "SYMPTOM" in headers else -1
 
-                    matched_ws = {}
-                    for ws in all_worksheets:
-                        title_clean = ws.title.strip().lower()
-                        for group_key, aliases in target_map.items():
-                            if group_key not in matched_ws:
-                                for alias in aliases:
-                                    if title_clean == alias or (alias in title_clean and "urgent" not in title_clean and "close" not in title_clean):
-                                        matched_ws[group_key] = ws
-                                        break
+                        reg_total, reg_close = 0, 0
+                        unspec_total, unspec_close = 0, 0
 
-                    if len(matched_ws) >= 2:
-                        for g_key, ws in matched_ws.items():
-                            rows = ws.get_all_values()
-                            total_rows = max(0, len(rows) - 1)
-                            close_rows = 0
-                            if rows and len(rows) > 1:
-                                headers = [str(h).strip().upper() for h in rows[0]]
-                                status_idx = -1
-                                for candidate in ["STATUS", "GROUPING", "STATE"]:
-                                    if candidate in headers:
-                                        status_idx = headers.index(candidate)
-                                        break
-                                
-                                if status_idx != -1:
-                                    for r in rows[1:]:
-                                        if len(r) > status_idx:
-                                            st = r[status_idx].strip().upper()
-                                            if st in ["CLOSE", "CLOSED", "COMPLETE PS", "BERHENTI BERLANGGANAN", "SELESAI"]:
-                                                close_rows += 1
-                                                
-                            sheet_stats[ws.title] = {"total": total_rows, "close": close_rows}
-                            grand_total += total_rows
-                            grand_close += close_rows
-                        
+                        for r in rows[1:]:
+                            if not any(c.strip() for c in r):
+                                continue
+                            grand_total += 1
+                            is_closed = False
+                            if close_idx != -1 and len(r) > close_idx:
+                                st = r[close_idx].strip().upper()
+                                if st in ["CLOSE", "CLOSED", "COMPLETE PS", "BERHENTI BERLANGGANAN", "SELESAI"]:
+                                    is_closed = True
+                                    grand_close += 1
+
+                            sym = r[symptom_idx].strip().upper() if (symptom_idx != -1 and len(r) > symptom_idx) else ""
+                            if "UNSPEC" in sym:
+                                unspec_total += 1
+                                if is_closed:
+                                    unspec_close += 1
+                            else:
+                                reg_total += 1
+                                if is_closed:
+                                    reg_close += 1
+
+                        sheet_stats = {
+                            f"{ws.title} (Reguler/Tiket)": {"total": reg_total, "close": reg_close},
+                            f"{ws.title} (Unspec)": {"total": unspec_total, "close": unspec_close},
+                        }
                         fetched_via_gspread = True
-                        logger.info(f"Berhasil membaca data SA Mempawah via gspread: Total={grand_total}, Close={grand_close}")
+                        logger.info(f"Berhasil membaca data {ws.title} via gspread: Total={grand_total}, Close={grand_close}")
                 except Exception as e:
-                    logger.warning(f"Gagal membaca sheet via gspread: {e}. Beralih ke fallback Web App.")
+                    logger.warning(f"Gagal membaca sheet {target_sheet_name} via gspread: {e}. Beralih ke Apps Script DATANEW.")
 
-            # 2. Fallback ke Web App jika gspread terkendala
-            if not fetched_via_gspread and config.WEB_APP_URL:
+            # 2. Pembacaan via Apps Script yang terhubung langsung ke sheet DATANEW
+            if not fetched_via_gspread:
                 try:
-                    url = f"{config.WEB_APP_URL}?action=read"
-                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=15) as resp:
-                        res_json = json.loads(resp.read().decode("utf-8"))
-                        data_items = res_json.get("data", [])
+                    init_data = self._call_datanew_apps_script("getInitialData", [])
+                    dash = init_data.get("dashboard", {})
+                    summary = dash.get("summary", {})
+                    grand_total = int(summary.get("total") or 0)
+                    grand_close = int(summary.get("close") or 0)
 
-                    sheet_groups = {
-                        "INSERA 22": [],
-                        "sta": [],
-                        "UNSPEC MPW": [],
-                        "UNSPEC STA": []
+                    reg_total, reg_close = 0, 0
+                    unspec_total, unspec_close = 0, 0
+                    manual_total, manual_close = 0, 0
+                    for tech in dash.get("technicians", []):
+                        c_obj = tech.get("close") or {}
+                        o_obj = tech.get("open") or {}
+                        rc = int(c_obj.get("reguler") or 0)
+                        ro = int(o_obj.get("reguler") or 0)
+                        uc = int(c_obj.get("unspec") or 0)
+                        uo = int(o_obj.get("unspec") or 0)
+                        mc = int(c_obj.get("manual") or 0)
+                        mo = int(o_obj.get("manual") or 0)
+                        reg_close += rc
+                        reg_total += rc + ro
+                        unspec_close += uc
+                        unspec_total += uc + uo
+                        manual_close += mc
+                        manual_total += mc + mo
+
+                    sheet_stats = {
+                        f"{target_sheet_name} (Reguler)": {"total": reg_total, "close": reg_close},
+                        f"{target_sheet_name} (Unspec)": {"total": unspec_total, "close": unspec_close},
                     }
+                    if manual_total > 0:
+                        sheet_stats[f"{target_sheet_name} (Manual)"] = {"total": manual_total, "close": manual_close}
 
-                    for it in data_items:
-                        src = (it.get("SHEET_SOURCE") or "").strip()
-                        src_lower = src.lower().replace(" ", "")
-                        
-                        if "insera22" in src_lower or src_lower == "insera22":
-                            sheet_groups["INSERA 22"].append(it)
-                        elif src_lower == "sta":
-                            sheet_groups["sta"].append(it)
-                        elif ("unspec" in src_lower or "undsepc" in src_lower or "unspac" in src_lower) and "mpw" in src_lower:
-                            sheet_groups["UNSPEC MPW"].append(it)
-                        elif ("unspec" in src_lower or "undsepc" in src_lower or "unspac" in src_lower) and "sta" in src_lower:
-                            sheet_groups["UNSPEC STA"].append(it)
-
-                    sheet_stats = {}
-                    grand_total = 0
-                    grand_close = 0
-                    for s_name, items in sheet_groups.items():
-                        t_count = len(items)
-                        c_count = 0
-                        for it in items:
-                            st = (it.get("STATUS") or "").strip().upper()
-                            gp = (it.get("Grouping") or "").strip().upper()
-                            if st in ["CLOSE", "CLOSED", "COMPLETE PS", "BERHENTI BERLANGGANAN", "SELESAI"] or gp == "CLOSE":
-                                c_count += 1
-                        sheet_stats[s_name] = {"total": t_count, "close": c_count}
-                        grand_total += t_count
-                        grand_close += c_count
-
-                    logger.info(f"Berhasil membaca data SA Mempawah via Web App: Total={grand_total}, Close={grand_close}")
+                    logger.info(f"Berhasil membaca data {target_sheet_name} via Apps Script: Total={grand_total}, Close={grand_close}")
                 except Exception as e:
-                    logger.error(f"Gagal mengambil data dari Web App: {e}")
+                    logger.error(f"Gagal mengambil data laporan dari {target_sheet_name}: {e}")
 
             # Simpan ke cache
             self._sa_cache = {

@@ -11,9 +11,10 @@ load_dotenv(BASE_DIR / ".env")
 # Konfigurasi Token dan Kunci API
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
-SHEET_NAME = os.getenv("SHEET_NAME", "KAWAL MPW")
-WEB_APP_URL = os.getenv("WEB_APP_URL", "https://script.google.com/macros/s/AKfycbye0gjnziy6_inPbigr-DfYKqdj0hYv_Msi2eAxoSkntHHskvp9__9IH51UZkoso0jY0w/exec")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1PrM2fyGxEWFno6WDFZVigO771yELsU3zRyrPfzO-8oQ")
+SHEET_NAME = os.getenv("SHEET_NAME", "DATANEW")
+WEB_APP_URL = os.getenv("WEB_APP_URL", "https://script.google.com/macros/s/AKfycbwsleRWZLr24S6AT-cSG0CstUeSl8xIA3ssnSsZ-Hf3c50ep_ko07G-qxMrs35yqUoAvQ/exec")
+BACKUP_SESSION_SHEET_ID = os.getenv("BACKUP_SESSION_SHEET_ID", "1GafB5UK6J5sLIIUe57qCkjJFQ9BEDNV_T7M7gxKFitw")
 
 # Path untuk file credentials Google Service Account
 # Jika path bukan path absolut, jadikan relatif terhadap folder project
@@ -52,6 +53,30 @@ try:
     TARGET_GROUP_ID = int(target_group_raw)
 except ValueError:
     TARGET_GROUP_ID = -1001342185601
+
+# ID Grup Telegram tujuan pengiriman hasil perintah laporan (/absen_assurance, /report, /dashboard)
+report_group_raw = os.getenv("REPORT_GROUP_ID", "-1003737866244").strip()
+try:
+    REPORT_GROUP_ID = int(report_group_raw)
+except ValueError:
+    REPORT_GROUP_ID = -1003737866244
+
+# Konfigurasi MyBranch (takalbagbar.id/mybranch) untuk Absen Assurance
+MYBRANCH_URL = os.getenv("MYBRANCH_URL", "https://takalbagbar.id/mybranch").rstrip("/")
+MYBRANCH_NIK = os.getenv("MYBRANCH_NIK", "20260004")
+MYBRANCH_PASSWORD = os.getenv("MYBRANCH_PASSWORD", "Dandi998")
+MYBRANCH_OTP_CHAT_ID = int(os.getenv("MYBRANCH_OTP_CHAT_ID", "794046951"))
+MYBRANCH_COOKIES_FILE = str(BASE_DIR / "mybranch_cookies.txt")
+MYBRANCH_STATE_FILE = str(BASE_DIR / "mybranch_state.json")
+
+# Jika MYBRANCH_STATE_JSON diset di environment variable (Railway), tulis ke mybranch_state.json saat startup
+_mybranch_state_env = os.getenv("MYBRANCH_STATE_JSON", "").strip()
+if _mybranch_state_env and not os.path.exists(MYBRANCH_STATE_FILE):
+    try:
+        with open(MYBRANCH_STATE_FILE, "w", encoding="utf-8") as _mf:
+            _mf.write(_mybranch_state_env)
+    except Exception as _me:
+        print(f"PERINGATAN: Gagal menulis mybranch_state.json dari MYBRANCH_STATE_JSON: {_me}")
 
 
 # Kategori Status Pekerjaan (Work Order)
