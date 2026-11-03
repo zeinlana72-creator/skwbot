@@ -69,6 +69,29 @@ MYBRANCH_OTP_CHAT_ID = int(os.getenv("MYBRANCH_OTP_CHAT_ID", "794046951"))
 MYBRANCH_COOKIES_FILE = str(BASE_DIR / "mybranch_cookies.txt")
 MYBRANCH_STATE_FILE = str(BASE_DIR / "mybranch_state.json")
 
+# Konfigurasi Bot Kedua (Provisioning / Assign WO PSB - @prov_snw_bot)
+PROV_BOT_TOKEN = os.getenv("PROV_BOT_TOKEN", "9132996761:AAF8nf4qaADaqY4Qo9s-0SHzxVCy3JcEnWE")
+PROV_MYBRANCH_NIK = os.getenv("PROV_MYBRANCH_NIK", "16953908")
+PROV_MYBRANCH_PASSWORD = os.getenv("PROV_MYBRANCH_PASSWORD", "@Condong2026")
+PROV_MYBRANCH_COOKIES_FILE = str(BASE_DIR / "mybranch_prov_cookies.txt")
+PROV_MYBRANCH_STATE_FILE = str(BASE_DIR / "mybranch_prov_state.json")
+prov_group_raw = os.getenv("PROV_ALLOWED_GROUP_ID", "-1004346054239").strip()
+try:
+    PROV_ALLOWED_GROUP_ID = int(prov_group_raw)
+except ValueError:
+    PROV_ALLOWED_GROUP_ID = -1004346054239
+
+# Konfigurasi Bot Ketiga (Assurance - @ass_snw_bot)
+ASS_BOT_TOKEN = os.getenv("ASS_BOT_TOKEN", "9058640514:AAFvsIYC2byOlT-HwH0AS1H4pPtJWLGEsxE")
+ASS_MYBRANCH_COOKIES_FILE = str(BASE_DIR / "mybranch_ass_cookies.txt")
+ASS_MYBRANCH_STATE_FILE = str(BASE_DIR / "mybranch_ass_state.json")
+
+# Konfigurasi Insera SSO (Close Tiket - @ass_snw_bot)
+INSERA_URL = os.getenv("INSERA_URL", "https://insera-sso.telkom.co.id/jw/web/login")
+INSERA_USERNAME = os.getenv("INSERA_USERNAME", "16023172")
+INSERA_PASSWORD = os.getenv("INSERA_PASSWORD", "Rahasia11#")
+INSERA_STATE_FILE = str(BASE_DIR / "insera_state.json")
+
 # Jika MYBRANCH_STATE_JSON diset di environment variable (Railway), tulis ke mybranch_state.json saat startup
 _mybranch_state_env = os.getenv("MYBRANCH_STATE_JSON", "").strip()
 if _mybranch_state_env and not os.path.exists(MYBRANCH_STATE_FILE):

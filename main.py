@@ -10,6 +10,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from telegram import (
     Update,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     BotCommand,
@@ -35,12 +36,25 @@ from dashboard_capture import capture_productivity_dashboard
 from mybranch_capture import (
     MyBranchAuthNeeded,
     capture_absen_assurance,
+    capture_ukur_masal,
+    extract_nd_numbers,
+    set_pending_ukur_context,
+    get_pending_ukur_context,
     get_pending_auth_step,
     initiate_tactical_login,
     submit_manual_captcha,
     submit_otp_code,
     clear_pending_auth,
     keepalive_mybranch_session,
+)
+from prov_bot import (
+    build_prov_application,
+    prov_post_init,
+    keepalive_prov_session,
+)
+from ass_bot import (
+    build_ass_application,
+    ass_post_init,
 )
 
 # Konfigurasi Logging
@@ -65,24 +79,20 @@ db = SheetsHandler()
     STATE_MANUAL_INPUT_WO
 ) = range(8)
 
-# Helper untuk memeriksa izin akses user
+# Helper untuk memeriksa izin akses user (semua anggota grup & user diizinkan)
 def is_authorized(user_id: int) -> bool:
-    if not config.ALLOWED_TELEGRAM_IDS:
-        # Jika tidak dikonfigurasi, semua orang diizinkan (untuk testing/kemudahan)
-        return True
-    return user_id in config.ALLOWED_TELEGRAM_IDS
+    return True
 
 async def block_group_interactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Memastikan anggota grup TARGET_GROUP_ID dan REPORT_GROUP_ID
-    tidak dapat melakukan perintah apapun di dalam grup.
+    Memastikan anggota di grup REPORT_GROUP_ID (-1003737866244) bebas menggunakan seluruh perintah,
+    dan hanya memblokir grup lain jika TARGET_GROUP_ID berbeda dari REPORT_GROUP_ID.
     """
     chat = update.effective_chat
-    if chat and chat.id in (config.TARGET_GROUP_ID, config.REPORT_GROUP_ID):
-        # Jika ada perintah teks (seperti /start, /report, /dashboard, dll) dari anggota grup
+    if chat and chat.id == config.TARGET_GROUP_ID and chat.id != config.REPORT_GROUP_ID:
+        # Jika ada perintah teks dari anggota grup auto-schedule lama
         if update.message and update.message.text and update.message.text.startswith("/"):
             raise ApplicationHandlerStop
-        # Jika ada interaksi tombol inline di grup
         if update.callback_query:
             await update.callback_query.answer("Perintah dinonaktifkan di grup ini.", show_alert=False)
             raise ApplicationHandlerStop
@@ -120,6 +130,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("📋 Absen Assurance Singkawang (/absen_assurance)", callback_data="menu_absen_assurance")
+        ],
+        [
+            InlineKeyboardButton("📡 Ukur Masal iBooster (/ukur_masal)", callback_data="menu_ukur_masal")
         ],
         [
             InlineKeyboardButton("⏰ Cek Berkas Pending", callback_data="menu_check_docs")
@@ -279,11 +292,6 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         report = await asyncio.to_thread(db.get_singkawang_report, jml_teknisi, kendala)
-        # Kirim hasil laporan ke grup REPORT_GROUP_ID (-1003737866244)
-        await context.bot.send_message(
-            chat_id=config.REPORT_GROUP_ID,
-            text=report["text"]
-        )
         keyboard = [
             [
                 InlineKeyboardButton("📊 Rincian Per Sheet", callback_data="singkawang_detail"),
@@ -298,10 +306,19 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await loading_msg.edit_text(
-            f"✅ *Laporan berhasil dikirimkan ke grup (`{config.REPORT_GROUP_ID}`)!*\n\n{report['text']}",
-            reply_markup=reply_markup
-        )
+        chat_id = update.effective_chat.id
+
+        if int(chat_id) == int(config.REPORT_GROUP_ID):
+            await loading_msg.edit_text(report["text"], reply_markup=reply_markup)
+        else:
+            await context.bot.send_message(
+                chat_id=config.REPORT_GROUP_ID,
+                text=report["text"]
+            )
+            await loading_msg.edit_text(
+                f"✅ *Laporan berhasil dikirimkan ke grup (`{config.REPORT_GROUP_ID}`)!*\n\n{report['text']}",
+                reply_markup=reply_markup
+            )
     except Exception as e:
         logger.error(f"Gagal memproses laporan: {e}")
         await loading_msg.edit_text(f"❌ Terjadi kesalahan saat membaca/mengirim data laporan:\n{e}")
@@ -311,11 +328,11 @@ handle_singkawang = handle_report
 handle_sa_mempawah = handle_report
 
 async def handle_menu_singkawang(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menangani klik tombol menu Laporan SINGKAWANG dan mengirim hasilnya ke grup report."""
+    """Menangani klik tombol menu Laporan SINGKAWANG."""
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text("⏳ Sedang menghitung & mengirim laporan SINGKAWANG ke grup...")
+    await query.edit_message_text("⏳ Sedang menghitung laporan SINGKAWANG...")
     try:
         report = await asyncio.to_thread(db.get_singkawang_report)
         keyboard = [
@@ -333,15 +350,20 @@ async def handle_menu_singkawang(update: Update, context: ContextTypes.DEFAULT_T
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         target_group_id = getattr(config, "REPORT_GROUP_ID", config.TARGET_GROUP_ID)
-        await context.bot.send_message(
-            chat_id=target_group_id,
-            text=report["text"]
-        )
-        await query.edit_message_text(
-            f"✅ *Laporan SINGKAWANG berhasil dikirim ke grup* (`{target_group_id}`)!\n\n{report['text']}",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
+        chat_id = update.effective_chat.id
+
+        if int(chat_id) == int(target_group_id):
+            await query.edit_message_text(report["text"], reply_markup=reply_markup)
+        else:
+            await context.bot.send_message(
+                chat_id=target_group_id,
+                text=report["text"]
+            )
+            await query.edit_message_text(
+                f"✅ *Laporan SINGKAWANG berhasil dikirim ke grup* (`{target_group_id}`)!\n\n{report['text']}",
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
     except Exception as e:
         logger.error(f"Gagal memproses laporan: {e}")
         keyboard = [[InlineKeyboardButton("⬅️ Kembali ke Menu", callback_data="menu_back")]]
@@ -482,11 +504,18 @@ async def handle_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        confirm_msg = f"✅ *Laporan Dashboard Produktivitas berhasil dikirimkan ke grup (`{target_group_id}`)!*"
-        if status_msg:
-            await status_msg.edit_text(confirm_msg, parse_mode="Markdown", reply_markup=reply_markup)
+        if int(chat_id) == int(target_group_id):
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
         else:
-            await context.bot.send_message(chat_id=chat_id, text=confirm_msg, parse_mode="Markdown", reply_markup=reply_markup)
+            confirm_msg = f"✅ *Laporan Dashboard Produktivitas berhasil dikirimkan ke grup (`{target_group_id}`)!*"
+            if status_msg:
+                await status_msg.edit_text(confirm_msg, parse_mode="Markdown", reply_markup=reply_markup)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=confirm_msg, parse_mode="Markdown", reply_markup=reply_markup)
 
     except Exception as e:
         logger.error(f"Gagal memproses dashboard capture: {e}", exc_info=True)
@@ -499,8 +528,9 @@ async def handle_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- ALUR: ABSEN ASSURANCE SINGKAWANG (/absen_assurance) ---
 
 async def _send_mybranch_auth_prompt(context: ContextTypes.DEFAULT_TYPE, requester_chat_id: int, status_msg=None):
-    """Memulai login Tactical MyBranch dan mengirimkan permintaan OTP (atau Captcha) ke Telegram user."""
-    logger.info(f"Memulai login MyBranch untuk requester_chat_id={requester_chat_id}")
+    """Memulai login Tactical MyBranch dan mengirimkan permintaan OTP (atau Captcha) ke chat pribadi Admin."""
+    otp_dest_chat_id = config.MYBRANCH_OTP_CHAT_ID if int(requester_chat_id) < 0 else requester_chat_id
+    logger.info(f"Memulai login MyBranch untuk requester_chat_id={requester_chat_id} (OTP dikirim ke {otp_dest_chat_id})")
     try:
         res = await asyncio.to_thread(initiate_tactical_login, requester_chat_id)
         step = res.get("step")
@@ -512,10 +542,18 @@ async def _send_mybranch_auth_prompt(context: ContextTypes.DEFAULT_TYPE, request
                 f"Kode OTP baru saja dikirim ke Telegram Anda (Telkom Akses).\n\n"
                 f"👉 *Silakan ketik/balas langsung 6 digit kode OTP tersebut di sini:*"
             )
-            if status_msg:
-                await status_msg.edit_text(otp_prompt, parse_mode="Markdown")
+            if int(requester_chat_id) < 0:
+                await context.bot.send_message(chat_id=otp_dest_chat_id, text=otp_prompt, parse_mode="Markdown")
+                if status_msg:
+                    await status_msg.edit_text(
+                        "🔐 Sesi MyBranch memerlukan verifikasi OTP. Permintaan OTP telah dikirimkan ke chat pribadi Admin.",
+                        parse_mode="Markdown"
+                    )
             else:
-                await context.bot.send_message(chat_id=requester_chat_id, text=otp_prompt, parse_mode="Markdown")
+                if status_msg:
+                    await status_msg.edit_text(otp_prompt, parse_mode="Markdown")
+                else:
+                    await context.bot.send_message(chat_id=otp_dest_chat_id, text=otp_prompt, parse_mode="Markdown")
 
         elif step == "captcha":
             captcha_photo = io.BytesIO(res["captcha_bytes"])
@@ -526,12 +564,14 @@ async def _send_mybranch_auth_prompt(context: ContextTypes.DEFAULT_TYPE, request
                 f"👉 *Silakan ketik 3 huruf Captcha pada gambar di atas* (lalu pada langkah berikutnya bot akan meminta kode OTP Telegram Anda):"
             )
             await context.bot.send_photo(
-                chat_id=requester_chat_id,
+                chat_id=otp_dest_chat_id,
                 photo=captcha_photo,
                 caption=caption,
                 parse_mode="Markdown"
             )
-            if status_msg:
+            if int(requester_chat_id) < 0 and status_msg:
+                await status_msg.edit_text("🔐 Sesi MyBranch memerlukan verifikasi login di chat pribadi Admin.")
+            elif status_msg:
                 try:
                     await status_msg.delete()
                 except Exception:
@@ -553,7 +593,7 @@ async def _deliver_absen_assurance_photo(context: ContextTypes.DEFAULT_TYPE, cha
 
     target_group_id = config.REPORT_GROUP_ID
 
-    # Kirim hasil tangkapan layar & laporan langsung ke grup target (-1003737866244) tanpa tombol menu
+    # Kirim hasil tangkapan layar & laporan langsung ke grup target (-1003737866244)
     if len(caption) <= 1024:
         await context.bot.send_photo(
             chat_id=target_group_id,
@@ -583,13 +623,20 @@ async def _deliver_absen_assurance_photo(context: ContextTypes.DEFAULT_TYPE, cha
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    confirm_text = (
-        f"✅ *Laporan Absen Assurance (Singkawang) berhasil dikirimkan ke grup (`{target_group_id}`)!*"
-    )
-    if status_msg:
-        await status_msg.edit_text(confirm_text, parse_mode="Markdown", reply_markup=reply_markup)
+    if int(chat_id) == int(target_group_id):
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
     else:
-        await context.bot.send_message(chat_id=chat_id, text=confirm_text, parse_mode="Markdown", reply_markup=reply_markup)
+        confirm_text = (
+            f"✅ *Laporan Absen Assurance (Singkawang) berhasil dikirimkan ke grup (`{target_group_id}`)!*"
+        )
+        if status_msg:
+            await status_msg.edit_text(confirm_text, parse_mode="Markdown", reply_markup=reply_markup)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=confirm_text, parse_mode="Markdown", reply_markup=reply_markup)
 
 
 async def handle_absen_assurance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -628,17 +675,140 @@ async def handle_absen_assurance(update: Update, context: ContextTypes.DEFAULT_T
         await status_msg.edit_text(f"❌ Terjadi kesalahan saat mengambil Absen Assurance:\n`{e}`", parse_mode="Markdown")
 
 
-async def handle_mybranch_auth_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menangani balasan kode Captcha atau kode OTP Tactical dari chat Telegram."""
-    if not update.message or not update.message.text:
-        return
-    step = get_pending_auth_step()
-    if not step:
+async def _deliver_ukur_masal_photo(context: ContextTypes.DEFAULT_TYPE, chat_id: int, nd_list: list[str], status_msg=None):
+    """Menjalankan Ukur Masal di MyBranch, lalu mengirim SS hasil dan file Excel (.xlsx) saja."""
+    screenshot_bytes, excel_bytes, excel_filename = await capture_ukur_masal(nd_list)
+
+    # 1. Kirim SS dan file Excel ke chat tempat perintah dijalankan
+    user_photo = io.BytesIO(screenshot_bytes)
+    user_photo.name = "hasil_ukur_masal.png"
+    await context.bot.send_photo(
+        chat_id=chat_id,
+        photo=user_photo,
+    )
+
+    user_excel = io.BytesIO(excel_bytes)
+    user_excel.name = excel_filename
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=user_excel,
+        filename=excel_filename,
+    )
+
+    # 2. Kirim juga SS dan file Excel ke grup report (-1003737866244) jika peminta bukan grup tersebut
+    target_group_id = getattr(config, "REPORT_GROUP_ID", None)
+    if target_group_id and int(chat_id) != int(target_group_id):
+        try:
+            group_photo = io.BytesIO(screenshot_bytes)
+            group_photo.name = "hasil_ukur_masal.png"
+            await context.bot.send_photo(
+                chat_id=target_group_id,
+                photo=group_photo,
+            )
+
+            group_excel = io.BytesIO(excel_bytes)
+            group_excel.name = excel_filename
+            await context.bot.send_document(
+                chat_id=target_group_id,
+                document=group_excel,
+                filename=excel_filename,
+            )
+        except Exception as ge:
+            logger.warning(f"Gagal meneruskan SS & Excel ukur masal ke grup {target_group_id}: {ge}")
+
+    if status_msg:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+
+async def handle_ukur_masal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Menangani perintah /ukur_masal (atau /ukur).
+    Jika belum menyertakan nomor internet, bot meminta user mengirimkan daftar nomor internet (ND).
+    """
+    user = update.effective_user
+    if not is_authorized(user.id):
+        if update.message:
+            await update.message.reply_text("Maaf, Anda tidak memiliki izin untuk menggunakan bot ini.")
+        elif update.callback_query:
+            await update.callback_query.answer("Akses ditolak.", show_alert=True)
         return
 
     chat_id = update.effective_chat.id
+
+    # Cek apakah user langsung menyertakan nomor ND bersama perintah (misal: /ukur_masal 162607207120)
+    raw_args_text = ""
+    if update.message and update.message.text:
+        parts = update.message.text.split(maxsplit=1)
+        if len(parts) > 1:
+            raw_args_text = parts[1]
+
+    nd_list = extract_nd_numbers(raw_args_text) if raw_args_text else []
+
+    if not nd_list:
+        context.user_data.clear()
+        context.user_data["awaiting_ukur_masal_nd"] = True
+        context.chat_data["awaiting_ukur_masal_nd"] = True
+        prompt_text = (
+            "📡 *Ukur Masal iBooster (MyBranch)*\n\n"
+            "Silakan *balas (reply) pesan ini* dengan *Nomor Internet (ND)* yang akan dimasukkan ke *Daftar ND*:\n"
+            "_(Bisa 1 nomor atau banyak nomor sekaligus, satu per baris / pisahkan dengan Enter, spasi, atau koma)_.\n\n"
+            "Contoh:\n"
+            "`162607207120`\n"
+            "`162603401214`"
+        )
+        if update.callback_query:
+            await update.callback_query.answer()
+            if int(chat_id) < 0:
+                await update.callback_query.message.reply_text(
+                    prompt_text,
+                    parse_mode="Markdown",
+                    reply_markup=ForceReply(selective=False, input_field_placeholder="Tempel Nomor Internet (ND) di sini...")
+                )
+            else:
+                keyboard = [[InlineKeyboardButton("❌ Batalkan", callback_data="menu_back")]]
+                await update.callback_query.message.reply_text(prompt_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            if int(chat_id) < 0:
+                await update.message.reply_text(
+                    prompt_text,
+                    parse_mode="Markdown",
+                    reply_markup=ForceReply(selective=True, input_field_placeholder="Tempel Nomor Internet (ND) di sini...")
+                )
+            else:
+                keyboard = [[InlineKeyboardButton("❌ Batalkan", callback_data="menu_back")]]
+                await update.message.reply_text(prompt_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # Jika user langsung mengirimkan nomor bersama command
+    context.user_data.clear()
+    status_msg = await update.message.reply_text(
+        f"⏳ Sedang memasukkan *{len(nd_list)} Nomor Internet (ND)* ke menu *Ukur Masal* di `takalbagbar.id/mybranch` dan mengambil SS hasilnya...",
+        parse_mode="Markdown"
+    )
+    try:
+        await _deliver_ukur_masal_photo(context, chat_id, nd_list, status_msg)
+    except MyBranchAuthNeeded:
+        await asyncio.to_thread(set_pending_ukur_context, nd_list, chat_id)
+        await status_msg.edit_text(
+            "🔐 Sesi login MyBranch belum aktif atau telah kedaluwarsa. Memulai proses login Tactical & meminta OTP..."
+        )
+        await _send_mybranch_auth_prompt(context, chat_id, status_msg)
+    except Exception as e:
+        logger.error(f"Gagal memproses ukur_masal: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Terjadi kesalahan saat menjalankan Ukur Masal:\n`{e}`", parse_mode="Markdown")
+
+
+async def handle_mybranch_auth_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menangani balasan kode Captcha/OTP Tactical atau input Daftar ND untuk Ukur Masal dari chat Telegram."""
+    if not update.message or not update.message.text:
+        return
+    chat_id = update.effective_chat.id
     text = update.message.text.strip()
 
+    step = get_pending_auth_step()
     if step == "captcha":
         wait_msg = await update.message.reply_text("⏳ Memverifikasi Captcha & meminta OTP Tactical ke server...")
         res = await asyncio.to_thread(submit_manual_captcha, text)
@@ -656,19 +826,32 @@ async def handle_mybranch_auth_input(update: Update, context: ContextTypes.DEFAU
 
     elif step == "otp":
         wait_msg = await update.message.reply_text("⏳ Memverifikasi kode OTP Tactical ke `takalbagbar.id/mybranch`...", parse_mode="Markdown")
+        pending_action, pending_nds = await asyncio.to_thread(get_pending_ukur_context)
         res = await asyncio.to_thread(submit_otp_code, text)
         if res.get("ok"):
             target_chat_id = res.get("target_chat_id") or chat_id
-            await wait_msg.edit_text(
-                "✅ *Login MyBranch Berhasil!* Sesi telah disimpan.\n"
-                "⏳ Sedang mengambil tangkapan layar *Absen Assurance (Singkawang)*...",
-                parse_mode="Markdown"
-            )
-            try:
-                await _deliver_absen_assurance_photo(context, target_chat_id, wait_msg)
-            except Exception as e:
-                logger.error(f"Gagal capture setelah login OTP: {e}", exc_info=True)
-                await wait_msg.edit_text(f"❌ Login berhasil, namun gagal mengambil tangkapan layar:\n`{e}`", parse_mode="Markdown")
+            if pending_action == "ukur_masal" and pending_nds:
+                await wait_msg.edit_text(
+                    f"✅ *Login MyBranch Berhasil!* Sesi telah disimpan.\n"
+                    f"⏳ Sedang memproses *Ukur Masal* untuk *{len(pending_nds)} ND*...",
+                    parse_mode="Markdown"
+                )
+                try:
+                    await _deliver_ukur_masal_photo(context, target_chat_id, pending_nds, wait_msg)
+                except Exception as e:
+                    logger.error(f"Gagal ukur masal setelah login OTP: {e}", exc_info=True)
+                    await wait_msg.edit_text(f"❌ Login berhasil, namun gagal mengambil hasil Ukur Masal:\n`{e}`", parse_mode="Markdown")
+            else:
+                await wait_msg.edit_text(
+                    "✅ *Login MyBranch Berhasil!* Sesi telah disimpan.\n"
+                    "⏳ Sedang mengambil tangkapan layar *Absen Assurance (Singkawang)*...",
+                    parse_mode="Markdown"
+                )
+                try:
+                    await _deliver_absen_assurance_photo(context, target_chat_id, wait_msg)
+                except Exception as e:
+                    logger.error(f"Gagal capture setelah login OTP: {e}", exc_info=True)
+                    await wait_msg.edit_text(f"❌ Login berhasil, namun gagal mengambil tangkapan layar:\n`{e}`", parse_mode="Markdown")
         else:
             msg = res.get("message", "Kode OTP salah atau kedaluwarsa.")
             if res.get("need_restart"):
@@ -679,6 +862,46 @@ async def handle_mybranch_auth_input(update: Update, context: ContextTypes.DEFAU
                     f"❌ *{msg}*\nSilakan ketik ulang kode OTP yang benar (atau ketik `/absen_assurance` untuk meminta OTP baru):",
                     parse_mode="Markdown"
                 )
+        raise ApplicationHandlerStop
+
+    # Jika user mengetik "ukur masal" secara langsung tanpa garis miring (/)
+    if text.lower() in ("ukur masal", "ukur_masal", "ukurmasal"):
+        await handle_ukur_masal(update, context)
+        raise ApplicationHandlerStop
+
+    # Jika bot sedang menunggu daftar Nomor Internet (ND) setelah user memanggil /ukur_masal
+    is_reply_to_ukur = False
+    if update.message.reply_to_message and update.message.reply_to_message.text:
+        if "Ukur Masal iBooster" in update.message.reply_to_message.text:
+            is_reply_to_ukur = True
+
+    if context.user_data.get("awaiting_ukur_masal_nd") or context.chat_data.get("awaiting_ukur_masal_nd") or is_reply_to_ukur:
+        nd_list = extract_nd_numbers(text)
+        if not nd_list:
+            if int(chat_id) > 0 or is_reply_to_ukur:
+                await update.message.reply_text(
+                    "⚠️ Nomor Internet (ND) tidak terbaca. Silakan kirimkan nomor internet (angka) yang valid, atau ketik /cancel untuk membatalkan."
+                )
+                raise ApplicationHandlerStop
+            return
+
+        context.user_data["awaiting_ukur_masal_nd"] = False
+        context.chat_data["awaiting_ukur_masal_nd"] = False
+        status_msg = await update.message.reply_text(
+            f"⏳ Sedang memasukkan *{len(nd_list)} Nomor Internet (ND)* ke menu *Ukur Masal* di `takalbagbar.id/mybranch` dan mengambil SS hasilnya...",
+            parse_mode="Markdown"
+        )
+        try:
+            await _deliver_ukur_masal_photo(context, chat_id, nd_list, status_msg)
+        except MyBranchAuthNeeded:
+            await asyncio.to_thread(set_pending_ukur_context, nd_list, chat_id)
+            await status_msg.edit_text(
+                "🔐 Sesi login MyBranch belum aktif atau telah kedaluwarsa. Memulai proses login Tactical & meminta OTP..."
+            )
+            await _send_mybranch_auth_prompt(context, chat_id, status_msg)
+        except Exception as e:
+            logger.error(f"Gagal memproses ukur_masal: {e}", exc_info=True)
+            await status_msg.edit_text(f"❌ Terjadi kesalahan saat menjalankan Ukur Masal:\n`{e}`", parse_mode="Markdown")
         raise ApplicationHandlerStop
 
 # --- ALUR PERCAKAPAN: UPDATE STATUS WO ---
@@ -1044,6 +1267,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/singkawang` - Perintah khusus laporan SINGKAWANG\n"
         "• `/dashboard` - Tangkapan layar tabel produktivitas teknisi & analisis rekap\n"
         "• `/absen_assurance` - Tangkapan layar dashboard Absen Assurance (Singkawang)\n"
+        "• `/ukur_masal` - Ukur masal nomor internet (ND) via iBooster MyBranch & kirim SS hasilnya\n"
         "• `/help` - Menampilkan panduan bantuan ini\n\n"
         "💡 Anda juga dapat mengklik tombol pada menu utama `/start` untuk mengelola WO, memperbarui status, dan menyusun pesan tagihan otomatis."
     )
@@ -1057,32 +1281,72 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def post_init(application):
-    """Mendaftarkan menu perintah (Bot Commands) ke aplikasi Telegram khusus di chat pribadi."""
+    """Mendaftarkan menu perintah (Bot Commands) ke aplikasi Telegram untuk chat pribadi & grup -1003737866244."""
     commands = [
         BotCommand("start", "Mulai bot & menu utama"),
+        BotCommand("ukur_masal", "Ukur masal nomor internet (ND) di MyBranch"),
+        BotCommand("absen_assurance", "Screenshot dashboard Absen Assurance Singkawang"),
         BotCommand("report", "Laporan SINGKAWANG (/report [teknisi] [kendala])"),
         BotCommand("singkawang", "Laporan SINGKAWANG"),
         BotCommand("dashboard", "Screenshot dashboard & rekap teknisi"),
-        BotCommand("absen_assurance", "Screenshot dashboard Absen Assurance Singkawang"),
         BotCommand("laporan", "Laporan operasional & tiket"),
         BotCommand("rekap", "Rekapitulasi berkas & order"),
         BotCommand("help", "Panduan dan bantuan penggunaan bot")
     ]
     try:
-        # Hapus seluruh tombol perintah (/) di seluruh grup dan khusus grup target
-        await application.bot.delete_my_commands(scope=BotCommandScopeDefault())
-        await application.bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
-        for gid in {config.TARGET_GROUP_ID, getattr(config, "REPORT_GROUP_ID", config.TARGET_GROUP_ID)}:
-            try:
-                await application.bot.delete_my_commands(scope=BotCommandScopeChat(gid))
-            except Exception:
-                pass
-
-        # Daftarkan tombol perintah (/) HANYA di chat pribadi (DM)
+        # Daftarkan tombol perintah (/) di seluruh chat pribadi, grup, dan khusus grup -1003737866244
+        await application.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
         await application.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
-        logger.info("Bot commands berhasil didaftarkan khusus chat pribadi (dihapus dari grup).")
+        await application.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
+        try:
+            await application.bot.set_my_commands(commands, scope=BotCommandScopeChat(config.REPORT_GROUP_ID))
+        except Exception as ge:
+            logger.warning(f"Gagal set_my_commands khusus grup {config.REPORT_GROUP_ID}: {ge}")
+
+        logger.info(f"Bot commands (/) berhasil dimunculkan di chat pribadi dan grup {config.REPORT_GROUP_ID}.")
     except Exception as e:
         logger.warning(f"Gagal mengatur bot commands ke Telegram: {e}")
+
+    # Jalankan Bot Kedua (@prov_snw_bot - Assign WO PSB) secara bersamaan di event loop yang sama
+    try:
+        prov_app = build_prov_application()
+        if prov_app:
+            await prov_app.initialize()
+            await prov_post_init(prov_app)
+            await prov_app.start()
+            await prov_app.updater.start_polling(drop_pending_updates=True)
+            application.bot_data["prov_app"] = prov_app
+            logger.info("🚀 Bot Kedua (@prov_snw_bot - Assign WO PSB) berhasil dijalankan bersamaan!")
+    except Exception as pe:
+        logger.error(f"Gagal menjalankan Bot Kedua (@prov_snw_bot): {pe}", exc_info=True)
+
+    # Jalankan Bot Ketiga (@ass_snw_bot) secara bersamaan di event loop yang sama
+    try:
+        ass_app = build_ass_application()
+        if ass_app:
+            await ass_app.initialize()
+            await ass_post_init(ass_app)
+            await ass_app.start()
+            await ass_app.updater.start_polling(drop_pending_updates=True)
+            application.bot_data["ass_app"] = ass_app
+            logger.info("🚀 Bot Ketiga (@ass_snw_bot) berhasil dijalankan bersamaan!")
+    except Exception as ae:
+        logger.error(f"Gagal menjalankan Bot Ketiga (@ass_snw_bot): {ae}", exc_info=True)
+
+
+async def post_shutdown(application):
+    """Menghentikan Bot Kedua (@prov_snw_bot) dan Bot Ketiga (@ass_snw_bot) dengan bersih saat aplikasi dimatikan."""
+    for key in ("prov_app", "ass_app"):
+        sub_app = application.bot_data.get(key)
+        if sub_app:
+            try:
+                if sub_app.updater and sub_app.updater.running:
+                    await sub_app.updater.stop()
+                if sub_app.running:
+                    await sub_app.stop()
+                await sub_app.shutdown()
+            except Exception as e:
+                logger.warning(f"Gagal menghentikan {key} saat shutdown: {e}")
 
 async def handle_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menangani tombol Kembali ke Menu Utama."""
@@ -1125,6 +1389,7 @@ def main():
         ApplicationBuilder()
         .token(config.TELEGRAM_BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
@@ -1149,6 +1414,7 @@ def main():
         # Keep-Alive sesi login MyBranch setiap 10 menit (600 detik) agar sesi tidak kadaluarsa karena idle
         async def _run_mybranch_keepalive(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.to_thread(keepalive_mybranch_session)
+            await asyncio.to_thread(keepalive_prov_session)
 
         job_queue.run_repeating(_run_mybranch_keepalive, interval=600, first=120, name="mybranch_keepalive")
         logger.info("Job Keep-Alive sesi MyBranch (setiap 10 menit) berhasil didaftarkan.")
@@ -1219,8 +1485,14 @@ def main():
         handle_absen_assurance
     ))
 
-    # Handler input kode OTP / Captcha MyBranch di chat pribadi (group=-2 agar dieksekusi sebelum handler lainnya)
-    application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_mybranch_auth_input), group=-2)
+    # Perintah Ukur Masal iBooster MyBranch
+    application.add_handler(CommandHandler(
+        ["ukur_masal", "ukurmasal", "ukur"],
+        handle_ukur_masal
+    ))
+
+    # Handler input kode OTP / Captcha MyBranch & Daftar ND Ukur Masal di chat pribadi maupun grup (group=-2 agar dieksekusi sebelum handler lainnya)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_mybranch_auth_input), group=-2)
 
     # Perintah Laporan / Report (dengan berbagai alias & variasi penulisan)
     application.add_handler(CommandHandler(
@@ -1238,6 +1510,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_singkawang_callback, pattern="^(singkawang_|sa_mempawah_|report_)"))
     application.add_handler(CallbackQueryHandler(handle_dashboard, pattern="^menu_dashboard$"))
     application.add_handler(CallbackQueryHandler(handle_absen_assurance, pattern="^menu_absen_assurance$"))
+    application.add_handler(CallbackQueryHandler(handle_ukur_masal, pattern="^menu_ukur_masal$"))
     application.add_handler(CallbackQueryHandler(handle_check_docs, pattern="^menu_check_docs$"))
     application.add_handler(CallbackQueryHandler(handle_menu_back, pattern="^menu_back$"))
 

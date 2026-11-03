@@ -1,13 +1,16 @@
 import asyncio
 import base64
 import http.cookiejar
+import io
 import json
 import logging
 import os
 import re
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import datetime, timezone, timedelta
+from xml.sax.saxutils import escape as xml_escape
 from playwright.async_api import async_playwright
 import config
 
@@ -109,7 +112,46 @@ def clear_pending_auth():
     state.pop("pending_step", None)
     state.pop("tiket", None)
     state.pop("target_chat_id", None)
+    state.pop("pending_action", None)
+    state.pop("pending_nds", None)
     _save_state(state)
+
+
+def set_pending_ukur_context(nd_list: list[str], chat_id: int | None = None):
+    state = _load_state()
+    state["pending_action"] = "ukur_masal"
+    state["pending_nds"] = nd_list
+    if chat_id:
+        state["target_chat_id"] = chat_id
+    _save_state(state)
+
+
+def get_pending_ukur_context() -> tuple[str | None, list[str]]:
+    state = _load_state()
+    return state.get("pending_action"), state.get("pending_nds") or []
+
+
+def extract_nd_numbers(raw_text: str) -> list[str]:
+    """Mengekstrak daftar nomor internet (ND) dari teks input user (dipisahkan enter, spasi, koma, titik koma)."""
+    if not raw_text:
+        return []
+    # Cari semua deretan angka minimal 6 digit (nomor internet/ND Telkom umumnya 9-13 digit)
+    candidates = re.findall(r"\b\d{6,16}\b", raw_text)
+    if not candidates:
+        # Fallback jika ada format non-standar per baris/spasi
+        for token in re.split(r"[\s,;]+", raw_text.strip()):
+            clean = token.strip()
+            if clean and not clean.startswith("/") and any(ch.isdigit() for ch in clean):
+                candidates.append(clean)
+    seen = set()
+    unique_nds = []
+    for nd in candidates:
+        if nd not in seen:
+            seen.add(nd)
+            unique_nds.append(nd)
+        if len(unique_nds) >= 500:
+            break
+    return unique_nds
 
 
 def _build_opener():
@@ -663,6 +705,416 @@ async def capture_absen_assurance() -> tuple[bytes, str]:
             caption = "\n".join(desc_lines)
 
             return screenshot_bytes, caption
+
+        finally:
+            await browser.close()
+
+
+def _build_ukur_masal_xlsx(results: list[dict], summary: dict, now_wib: datetime) -> bytes:
+    """
+    Membangun file Excel (.xlsx) asli dengan kolom-kolom terpisah yang rapi,
+    header berwarna biru tua, border tabel, lebar kolom otomatis, dan warna status ONU.
+    """
+    headers = [
+        "NO",
+        "ND",
+        "STATUS ONU",
+        "RX ONU (dBm)",
+        "RX OLT (dBm)",
+        "PORT (CALLING STATION ID)",
+        "OLT",
+        "SN ONT",
+        "TIPE ONT",
+        "JARAK (M)",
+        "STATUS KONEKSI",
+        "DURASI SESI",
+        "IP ADDRESS",
+        "LAST SEEN",
+    ]
+    col_widths = [6, 16, 14, 14, 14, 38, 12, 20, 20, 12, 16, 15, 16, 22]
+
+    def _col_letter(col_idx_1based: int) -> str:
+        res = ""
+        n = col_idx_1based
+        while n > 0:
+            n, rem = divmod(n - 1, 26)
+            res = chr(65 + rem) + res
+        return res
+
+    def _cell_xml(row_num: int, col_num: int, val: str, style_id: int = 1) -> str:
+        ref = f"{_col_letter(col_num)}{row_num}"
+        safe_val = xml_escape(str(val if val is not None else ""))
+        return f'<c r="{ref}" t="inlineStr" s="{style_id}"><is><t>{safe_val}</t></is></c>'
+
+    rows_xml = []
+
+    # Baris 1: Header Tabel
+    header_cells = [_cell_xml(1, c_idx, h_text, style_id=2) for c_idx, h_text in enumerate(headers, start=1)]
+    rows_xml.append(f'<row r="1" ht="24" customHeight="1">{"".join(header_cells)}</row>')
+
+    # Baris 2 dst: Data Hasil Ukur Masal
+    for idx, item in enumerate(results, start=1):
+        row_num = idx + 1
+        onu_status = str(item.get("onu") or "-").strip()
+        onu_upper = onu_status.upper()
+
+        # Pisahkan SN ONT dan Tipe ONT
+        sn_raw = str(item.get("sn_ont") or "-")
+        sn_parts = [p.strip() for p in sn_raw.split("/") if p.strip()]
+        sn_ont = sn_parts[0] if len(sn_parts) >= 1 else "-"
+        tipe_ont = sn_parts[1] if len(sn_parts) >= 2 else "-"
+
+        # Pisahkan Status Koneksi dan Durasi Sesi
+        kon_raw = str(item.get("koneksi") or "-")
+        kon_parts = [p.strip() for p in kon_raw.split("/") if p.strip()]
+        status_koneksi = kon_parts[0] if len(kon_parts) >= 1 else "-"
+        durasi_sesi = kon_parts[1] if len(kon_parts) >= 2 else "-"
+
+        # Pilih warna sel untuk kolom STATUS ONU (3 = hijau ONLINE, 4 = merah LOS/OFFLINE, 1 = normal)
+        if "ONLINE" in onu_upper:
+            onu_style = 3
+        elif any(k in onu_upper for k in ["LOS", "OFF", "DYING", "TIDAK"]):
+            onu_style = 4
+        else:
+            onu_style = 1
+
+        row_values = [
+            (str(idx), 5),
+            (item.get("nd") or "-", 1),
+            (onu_status, onu_style),
+            (item.get("rx_onu") or "-", 5),
+            (item.get("rx_olt") or "-", 5),
+            (item.get("port") or "-", 1),
+            (item.get("olt") or "-", 5),
+            (sn_ont, 1),
+            (tipe_ont, 1),
+            (item.get("jarak") or "-", 5),
+            (status_koneksi, 5),
+            (durasi_sesi, 5),
+            (item.get("ip") or "-", 1),
+            (item.get("last_seen") or "-", 5),
+        ]
+
+        cell_tags = [
+            _cell_xml(row_num, c_idx, val, style_id=st_id)
+            for c_idx, (val, st_id) in enumerate(row_values, start=1)
+        ]
+        rows_xml.append(f'<row r="{row_num}" ht="20" customHeight="1">{"".join(cell_tags)}</row>')
+
+    cols_xml = "".join(
+        f'<col min="{i}" max="{i}" width="{w}" customWidth="1"/>'
+        for i, w in enumerate(col_widths, start=1)
+    )
+    last_col = _col_letter(len(headers))
+    last_row = max(1, len(results) + 1)
+
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<dimension ref="A1:{last_col}{last_row}"/>'
+        '<sheetViews><sheetView tabSelected="1" workbookViewId="0">'
+        '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+        '</sheetView></sheetViews>'
+        f'<cols>{cols_xml}</cols>'
+        f'<sheetData>{"".join(rows_xml)}</sheetData>'
+        f'<autoFilter ref="A1:{last_col}{last_row}"/>'
+        '</worksheet>'
+    )
+
+    styles_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="4">'
+        '<font><sz val="10"/><name val="Calibri"/><color rgb="FF1F2937"/></font>'
+        '<font><b/><sz val="10"/><name val="Calibri"/><color rgb="FFFFFFFF"/></font>'
+        '<font><b/><sz val="10"/><name val="Calibri"/><color rgb="FF107C41"/></font>'
+        '<font><b/><sz val="10"/><name val="Calibri"/><color rgb="FFC00000"/></font>'
+        '</fonts>'
+        '<fills count="5">'
+        '<fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFE2EFDA"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFFCE4D6"/><bgColor indexed="64"/></patternFill></fill>'
+        '</fills>'
+        '<borders count="2">'
+        '<border><left/><right/><top/><bottom/><diagonal/></border>'
+        '<border>'
+        '<left style="thin"><color rgb="FFD0D7DE"/></left>'
+        '<right style="thin"><color rgb="FFD0D7DE"/></right>'
+        '<top style="thin"><color rgb="FFD0D7DE"/></top>'
+        '<bottom style="thin"><color rgb="FFD0D7DE"/></bottom>'
+        '<diagonal/>'
+        '</border>'
+        '</borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="6">'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="2" fillId="3" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="3" fillId="4" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>'
+        '</cellXfs>'
+        '</styleSheet>'
+    )
+
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="Hasil Ukur Masal" sheetId="1" r:id="rId1"/></sheets>'
+        '</workbook>'
+    )
+
+    workbook_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+        '</Relationships>'
+    )
+
+    root_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+
+    content_types_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        '</Types>'
+    )
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types_xml)
+        zf.writestr("_rels/.rels", root_rels_xml)
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+        zf.writestr("xl/styles.xml", styles_xml)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    return buf.getvalue()
+
+
+async def capture_ukur_masal(nd_list: list[str]) -> tuple[bytes, bytes, str]:
+    """
+    Membuka halaman https://takalbagbar.id/mybranch/apps/tickets/ukur-masal,
+    memasukkan daftar ND ke kolom Daftar ND, menekan tombol Ukur ND,
+    menunggu hasil pengukuran selesai, lalu mengambil screenshot bagian hasil di bawahnya
+    beserta file Excel (.xlsx) dengan kolom-kolom terpisah yang rapi.
+    Jika sesi belum login / kadaluarsa, melempar MyBranchAuthNeeded.
+    """
+    clean_nds = []
+    seen = set()
+    for item in nd_list:
+        s = str(item).strip()
+        if s and s not in seen:
+            seen.add(s)
+            clean_nds.append(s)
+    if not clean_nds:
+        raise ValueError("Daftar Nomor Internet (ND) kosong.")
+
+    state = _load_state()
+    cookies = state.get("cookies", [])
+    if not cookies:
+        raise MyBranchAuthNeeded("Sesi login belum tersedia.")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu"
+            ]
+        )
+        context = await browser.new_context(
+            viewport={"width": 1650, "height": 950},
+            device_scale_factor=2,
+            user_agent=USER_AGENT,
+            color_scheme="dark",
+        )
+        await context.add_cookies(cookies)
+        page = await context.new_page()
+
+        await page.add_init_script("""() => {
+            try {
+                localStorage.setItem('theme', 'dark');
+                document.documentElement.classList.remove('light');
+                document.documentElement.classList.add('dark');
+                document.documentElement.style.colorScheme = 'dark';
+            } catch (e) {}
+        }""")
+
+        try:
+            target_url = f"{config.MYBRANCH_URL}/apps/tickets/ukur-masal"
+            logger.info(f"Membuka halaman Ukur Masal MyBranch ({len(clean_nds)} ND): {target_url}")
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(2500)
+
+            current_url = page.url
+            body_text = await page.inner_text("body")
+            if "/login" in current_url or ("Sign In" in body_text and "Tactical" in body_text):
+                logger.info("Sesi MyBranch belum login atau sudah kedaluwarsa saat mengakses Ukur Masal.")
+                raise MyBranchAuthNeeded("Sesi login kedaluwarsa.")
+
+            # Pastikan mode dark aktif
+            await page.evaluate("""() => {
+                document.documentElement.classList.remove('light');
+                document.documentElement.classList.add('dark');
+                document.documentElement.style.colorScheme = 'dark';
+            }""")
+
+            # Temukan textarea Daftar ND dan masukkan nomor internet
+            textarea = await page.wait_for_selector("textarea", timeout=15000)
+            await textarea.fill("\n".join(clean_nds))
+            await page.wait_for_timeout(500)
+
+            # Klik tombol "Ukur ... ND" di dalam card input pertama
+            ukur_btn = await page.query_selector("div[data-slot='card'] button")
+            if not ukur_btn:
+                raise RuntimeError("Tombol 'Ukur ND' tidak ditemukan di halaman Ukur Masal.")
+
+            await ukur_btn.click()
+
+            # Tunggu hingga proses pengukuran seluruh ND selesai (maksimal 120 detik)
+            expected_count = len(clean_nds)
+            max_wait_sec = min(120, max(25, expected_count * 6))
+            for step in range(max_wait_sec):
+                await page.wait_for_timeout(1000)
+                status_info = await page.evaluate("""() => {
+                    const cards = document.querySelectorAll("div[data-slot='card']");
+                    const firstBtn = cards.length > 0 ? cards[0].querySelector('button') : null;
+                    const btnDisabled = firstBtn ? firstBtn.disabled : false;
+                    const btnText = firstBtn ? (firstBtn.innerText || '').trim() : '';
+                    const rows = document.querySelectorAll('table tbody tr');
+                    return {
+                        btnDisabled,
+                        btnText,
+                        rowCount: rows.length
+                    };
+                }""")
+                if (
+                    not status_info["btnDisabled"]
+                    and status_info["rowCount"] >= expected_count
+                    and step >= 1
+                ):
+                    break
+                # Jika tombol sudah kembali aktif (tidak disabled) setelah beberapa detik meski sebagian ND tidak valid
+                if not status_info["btnDisabled"] and status_info["rowCount"] > 0 and step >= 4:
+                    break
+
+            await page.wait_for_timeout(800)
+
+            # Perbarui cookies sesi agar tetap awet
+            try:
+                fresh_cookies = await context.cookies()
+                if fresh_cookies:
+                    state = _load_state()
+                    state["cookies"] = [
+                        {
+                            "name": c["name"],
+                            "value": c["value"],
+                            "domain": c.get("domain", "takalbagbar.id"),
+                            "path": c.get("path", "/mybranch"),
+                            "secure": bool(c.get("secure", True)),
+                        }
+                        for c in fresh_cookies
+                    ]
+                    state["last_keepalive"] = datetime.now(timezone.utc).isoformat()
+                    _save_state(state, sync_cloud=True)
+            except Exception as ce:
+                logger.warning(f"Gagal memperbarui cookies seusai Ukur Masal: {ce}")
+
+            # Ekstrak hasil dari tabel dan kartu ringkasan, sekaligus rapikan tampilan untuk screenshot hasil di bawahnya
+            ukur_data = await page.evaluate("""() => {
+                // Sembunyikan sidebar dan header atas agar screenshot fokus pada hasil
+                const sidebar = document.querySelector('[data-slot="sidebar"]');
+                if (sidebar) sidebar.style.display = 'none';
+                const sidebarWrapper = document.querySelector('.xl\\\\:block.hidden');
+                if (sidebarWrapper) sidebarWrapper.style.display = 'none';
+                const topHeader = document.querySelector('header');
+                if (topHeader) topHeader.style.display = 'none';
+                const bodyWrapper = document.querySelector('.body-wrapper');
+                if (bodyWrapper) {
+                    bodyWrapper.style.marginLeft = '0';
+                    bodyWrapper.style.width = '100%';
+                }
+
+                const container = document.querySelector('.container') || document.querySelector('main') || document.body;
+                container.style.maxWidth = '100%';
+                container.style.padding = '16px 24px';
+
+                // Sembunyikan kartu input Daftar ND di atas agar fokus pada bagian hasil di bawahnya
+                const cards = container.querySelectorAll("div[data-slot='card']");
+                if (cards.length >= 2) {
+                    cards[0].style.display = 'none';
+                }
+
+                // Buka overflow tabel agar semua kolom terlihat utuh tanpa terpotong scrollbar
+                document.querySelectorAll('.overflow-x-auto').forEach(el => {
+                    el.style.overflow = 'visible';
+                });
+
+                // Ambil ringkasan dari grid kartu
+                const summary = {};
+                const gridBoxes = container.querySelectorAll('.grid > div');
+                gridBoxes.forEach(box => {
+                    const lines = (box.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+                    if (lines.length >= 2) {
+                        summary[lines[0]] = lines.slice(1).join(' ');
+                    }
+                });
+
+                // Ambil data baris tabel hasil ukur
+                const rows = Array.from(container.querySelectorAll('table tbody tr'));
+                const results = rows.map(tr => {
+                    const cells = Array.from(tr.querySelectorAll('td')).map(td => (td.innerText || '').trim().replace(/\\n+/g, ' / '));
+                    return {
+                        nd: cells[0] || '-',
+                        onu: cells[1] || '-',
+                        rx_onu: cells[2] || '-',
+                        rx_olt: cells[3] || '-',
+                        port: cells[4] || '-',
+                        olt: cells[5] || '-',
+                        sn_ont: cells[6] || '-',
+                        jarak: cells[7] || '-',
+                        koneksi: cells[8] || '-',
+                        ip: cells[9] || '-',
+                        last_seen: cells[10] || '-'
+                    };
+                });
+
+                // Buat pembungkus khusus hasil ukur (kartu ringkasan + tabel hasil) untuk di-screenshot
+                let resultTarget = container;
+                if (cards.length >= 2) {
+                    resultTarget = container;
+                }
+                return { summary, results };
+            }""")
+
+            await page.wait_for_timeout(300)
+
+            target_elem = await page.query_selector(".container") or await page.query_selector("main") or await page.query_selector("body")
+            screenshot_bytes = await target_elem.screenshot()
+
+            tz_wib = timezone(timedelta(hours=7))
+            now_wib = datetime.now(tz_wib)
+            results = ukur_data.get("results", [])
+            summary = ukur_data.get("summary", {})
+
+            excel_bytes = _build_ukur_masal_xlsx(results, summary, now_wib)
+            excel_filename = f"Hasil_Ukur_Masal_{now_wib.strftime('%d-%m-%Y_%H%M')}.xlsx"
+            return screenshot_bytes, excel_bytes, excel_filename
 
         finally:
             await browser.close()
