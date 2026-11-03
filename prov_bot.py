@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import urllib.error
 import urllib.request
@@ -34,6 +35,123 @@ import config
 from mybranch_capture import _solve_captcha_with_gemini, _get_playwright_cookies, USER_AGENT
 
 logger = logging.getLogger("prov_bot")
+
+
+def _generate_smart_nyeleneh_reply(user_text: str, user_name: str, bot_prev_text: str = "") -> str:
+    """Menghasilkan balasan santai, nyeleneh, dan NYAMBUNG secara kontekstual dengan pesan yang di-reply."""
+    t = user_text.lower().strip()
+    name = user_name or "bang"
+
+    # 1. Coba gunakan Gemini AI jika ada API Key agar jawaban dinamis & sangat nyambung
+    if getattr(config, "GEMINI_API_KEY", ""):
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=config.GEMINI_API_KEY)
+            model = genai.GenerativeModel("gemini-3.8-flash")
+            prompt = (
+                "Kamu adalah bot Telegram (@prov_snw_bot) yang santai, kocak, lucu, nyeleneh, tapi ramah dan nyambung dengan obrolan teknisi lapangan Telkom / IndiHome di Singkawang (Kalimantan Barat).\n"
+                "- Balas dengan NYAMBUNG dan kontekstual terhadap apa yang diomongin oleh user yang me-reply pesanmu.\n"
+                "- Gunakan bahasa gaul / tongkrongan santai ala anak lapangan/teknisi Singkawang (boleh selipin istilah ODP, dropcore, redaman, korlap, BIMA jika pas).\n"
+                "- Balasan SANGAT SINGKAT (1 kalimat saja, maksimal 2 kalimat pendek), jangan panjang-panjang.\n"
+                "- Jangan gunakan tanda kutip, jangan pakai salam pembuka/penutup formal.\n\n"
+                f"Pesan bot sebelumnya: '{bot_prev_text[:120]}'\n"
+                f"Pesan user ({name}): '{user_text[:120]}'\n"
+                "Balasan singkat bot:"
+            )
+            resp = model.generate_content(prompt, request_options={"timeout": 3.0})
+            if resp and resp.text:
+                out = resp.text.strip().replace('"', '').replace("'", "")
+                if out and len(out) <= 200:
+                    return out
+        except Exception as ge:
+            logger.debug(f"[ProvBot] Gemini reply skipped ({ge}), fallback to smart matcher.")
+
+    # 2. Smart Contextual Rule Matcher (respons instan, tepat sasaran & nyambung)
+    if re.search(r"hapus|delete|ilangin", t):
+        return random.choice([
+            f"Awas ya kalo gak beneran dihapus {name}, tar kena tegur korlap lu wkwk 🗿",
+            f"Beneran ya janji dihapus {name}, jangan NATO (No Action Talk Only) wkwk 😂",
+            f"Siap aman {name}, awas aja kalo masih nongol ntar gua laporin korlap 😜",
+        ])
+
+    if re.search(r"hmmm?|yela+|hadeh|cape|lelah|males|pusing", t):
+        return random.choice([
+            f"Napa lu lemes gitu {name}, cape abis narik dropcore kah? 🪜",
+            f"Yelaaa mulu lu {name}, mending bantuin temen lu noh lagi nyari ODP 😌",
+            f"Baru segitu aja udah hadeh {name}, inget cicilan masih melambai-lambai 🏃‍♂️💨",
+        ])
+
+    if re.search(r"\baman\b|\bsantai\b|\btenang\b|\bkalem\b", t):
+        return random.choice([
+            f"Beneran aman gak nih {name}? Jangan sampe ntar pas dicek BIMA zonk ya 🤣",
+            f"Santai di awal, panik pas rekap absen lu ntar {name} wkwk 🗿",
+            f"Aman aman bae lu {name}, kerjaan udah beres beneran belum tuh? 😜",
+        ])
+
+    if re.search(r"\bsiap\b|\boke+\b|\bok\b|\bsip\b|\byoi+\b", t):
+        return random.choice([
+            f"Siap siap mulu lu {name}, bukti fisik closed-nya mana coba? 📸",
+            f"Okee siap {name}! Tapi jangan lupa action-nya, jangan omdo wkwk 😜",
+            f"Yoi mantap {name}, gaspol terus pantang kendor sebelum target tembus! 🚀",
+        ])
+
+    if re.search(r"wkwk|haha|hehe|xixi|ngakak", t):
+        return random.choice([
+            f"Malah ketawa lu {name}, WO PSB udah kelar semua emang? 👀",
+            f"Tertawa di atas kabel dropcore yang kusut ya {name} wkwk 😜",
+            f"Seneng amat ketawanya {name}, abis dapet tip dari pelanggan ya? 🤑",
+        ])
+
+    if re.search(r"makasih|terima kasih|tengkyu|thanks", t):
+        return random.choice([
+            f"Sama-sama {name}, traktir kopi hitam dulu lah minimal di warkop ☕",
+            f"Yoi santai aja {name}, jangan lupa bintang 5-nya ya wkwk ⭐",
+        ])
+
+    if re.search(r"makan|ngopi|kopi|lap[ae]r|sarapan", t):
+        return random.choice([
+            f"Titip gorengan sama kopi susu satu ya {name}, jangan lupa bungkusin ☕🤤",
+            f"Ngopi mulu {name}, kerjaan udah beres belum tuh? Jangan ngilang pas jam kerja gih 🚶‍♂️",
+        ])
+
+    if re.search(r"^(p+|woi+|woy+|halo+|hai+|oy+|oi+)\b", t):
+        return random.choice([
+            f"Nge-P nge-P bae lu {name}, kirain mau ngasih nomor WO taunya cuma nyapa 🥱",
+            f"Oyy {name}, ada apa manggil? Mau curhat apa mau disuruh manjat tiang? 🪜",
+            f"Hadir bang! Jangan cuma nyapa doang, info tiket close mana? 📡",
+        ])
+
+    if re.search(r"apa|kenapa|napa|knp", t):
+        return random.choice([
+            f"Kepo bet lu {name}, mau bantuin ngerjain WO apa gimana nih? 🛠️",
+            f"Gak kenapa-kenapa kok {name}, cuma heran aja liat kelakuan lu wkwk 🗿",
+        ])
+
+    if re.search(r"korlap|bos|mandor|atasan", t):
+        return random.choice([
+            f"Sssttt jangan nyebut korlap sembarangan {name}, orangnya punya telinga di mana-mana 🤫",
+            f"Dicariin korlap lu {name}, buruan setor absen gih sebelum kena semprot 🏃‍♂️",
+        ])
+
+    if re.search(r"ganteng|keren|hebat|pintar|pinter", t):
+        return random.choice([
+            f"Makasih pujiannya {name}, tapi maaf saya udah ada yang punya (sistem server) 😎",
+            f"Baru sadar ya {name}? Bot Singkawang emang gak ada lawan wkwk 🦾",
+        ])
+
+    if re.search(r"boong|hoax|dusta|ngibul", t):
+        return random.choice([
+            f"Mana ada bot boong {name}, lu kali tuh yang suka ngibul pas izin sakit 😜",
+            f"Fakta no hoax ini {name}, cek aja langsung di sistem kalo gak percaya 📊",
+        ])
+
+    return random.choice([
+        f"Iya iya paham kok maksud lu {name}, tapi kerjaan hari ini beresin dulu yaa 😌",
+        f"Jangan senggol-senggol mulu {name}, lagi sibuk ngitung rekap absen nih 🗿",
+        f"Mau WO apa mau kopi {name}? Kalo gaada perintah mending santai dulu gih 🚶‍♂️",
+        f"Ngetik apaan sih {name}, gak kebaca di sistem BIMA saya tuh bro 📡",
+        f"Bukannya kerja malah ngajak bot ngobrol... awas dicariin korlap tuh {name}! 🏃‍♂️💨",
+    ])
 
 
 class ProvMyBranchAuthNeeded(Exception):
@@ -1591,6 +1709,19 @@ async def handle_prov_text_input(update: Update, context: ContextTypes.DEFAULT_T
 
         context.user_data.clear()
         await _execute_assign_wo(chat_id, context, wo_num, tech_nik)
+        return
+
+    # 5. Balas balasan (reply) atau mention di grup dengan santai/nyeleneh jika bukan perintah
+    reply_msg = update.effective_message.reply_to_message
+    is_reply_to_bot = bool(reply_msg and reply_msg.from_user and reply_msg.from_user.id == context.bot.id)
+    bot_username = getattr(context.bot, "username", "prov_snw_bot") or "prov_snw_bot"
+    is_mention = f"@{bot_username.lower()}" in lower_text or "@prov_snw_bot" in lower_text
+
+    if is_reply_to_bot or is_mention:
+        user_name = update.effective_user.first_name if update.effective_user else "bang"
+        bot_prev = (reply_msg.text or reply_msg.caption or "") if reply_msg else ""
+        reply_txt = await asyncio.to_thread(_generate_smart_nyeleneh_reply, text, user_name, bot_prev)
+        await update.effective_message.reply_text(reply_txt)
         return
 
 

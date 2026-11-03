@@ -209,7 +209,27 @@ async def start_insera_login_flow(chat_id: int) -> Tuple[bool, str, Optional[byt
 
     try:
         logger.info("[Insera] Membuka URL login: %s", config.INSERA_URL)
-        await page.goto(config.INSERA_URL, timeout=45000, wait_until="domcontentloaded")
+        
+        # Test koneksi TCP port 443 terlebih dahulu untuk diagnostik cepat
+        import socket
+        try:
+            ip = socket.gethostbyname("insera-sso.telkom.co.id")
+            logger.info(f"[Insera] Resolved IP: {ip}")
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(6.0)
+            tcp_res = s.connect_ex((ip, 443))
+            s.close()
+            logger.info(f"[Insera] TCP 443 connect_ex: {tcp_res}")
+            if tcp_res != 0:
+                ss = None
+                await context.close()
+                await browser.close()
+                await p.stop()
+                return False, f"Server Insera ({ip}:443) tidak merespons koneksi (TCP error {tcp_res}). Server Telkom memblokir IP server cloud (Railway luar negeri). Diperlukan proxy IP Indonesia.", None
+        except Exception as se:
+            logger.warning(f"[Insera] Socket test error: {se}")
+
+        await page.goto(config.INSERA_URL, timeout=30000, wait_until="commit")
         await page.wait_for_timeout(1500)
 
         # Isi kredensial dan centang Terms of Use
@@ -525,7 +545,7 @@ async def execute_close_ujung(ticket_no: str, actual_solution: str) -> Tuple[byt
 
     try:
         logger.info(f"[Insera] Memulai Close Ujung untuk Tiket: {ticket_no}")
-        await page.goto(config.INSERA_URL, timeout=45000, wait_until="domcontentloaded")
+        await page.goto(config.INSERA_URL, timeout=30000, wait_until="commit")
         await page.wait_for_timeout(2000)
 
         # 1. Cari Tiket
@@ -624,7 +644,7 @@ async def execute_close_mediacare(ticket_no: str, actual_solution: str) -> Tuple
 
     try:
         logger.info(f"[Insera] Memulai Close Mediacare untuk Tiket: {ticket_no}")
-        await page.goto(config.INSERA_URL, timeout=45000, wait_until="domcontentloaded")
+        await page.goto(config.INSERA_URL, timeout=30000, wait_until="commit")
         await page.wait_for_timeout(2000)
 
         # 1. Cari Tiket
@@ -690,3 +710,4 @@ async def execute_close_mediacare(ticket_no: str, actual_solution: str) -> Tuple
         await context.close()
         await browser.close()
         await p.stop()
+
