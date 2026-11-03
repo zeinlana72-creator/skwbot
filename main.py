@@ -52,10 +52,6 @@ from prov_bot import (
     prov_post_init,
     keepalive_prov_session,
 )
-from ass_bot import (
-    build_ass_application,
-    ass_post_init,
-)
 
 # Konfigurasi Logging
 logging.basicConfig(
@@ -1320,33 +1316,19 @@ async def post_init(application):
     except Exception as pe:
         logger.error(f"Gagal menjalankan Bot Kedua (@prov_snw_bot): {pe}", exc_info=True)
 
-    # Jalankan Bot Ketiga (@ass_snw_bot) secara bersamaan di event loop yang sama
-    try:
-        ass_app = build_ass_application()
-        if ass_app:
-            await ass_app.initialize()
-            await ass_post_init(ass_app)
-            await ass_app.start()
-            await ass_app.updater.start_polling(drop_pending_updates=True)
-            application.bot_data["ass_app"] = ass_app
-            logger.info("🚀 Bot Ketiga (@ass_snw_bot) berhasil dijalankan bersamaan!")
-    except Exception as ae:
-        logger.error(f"Gagal menjalankan Bot Ketiga (@ass_snw_bot): {ae}", exc_info=True)
-
 
 async def post_shutdown(application):
-    """Menghentikan Bot Kedua (@prov_snw_bot) dan Bot Ketiga (@ass_snw_bot) dengan bersih saat aplikasi dimatikan."""
-    for key in ("prov_app", "ass_app"):
-        sub_app = application.bot_data.get(key)
-        if sub_app:
-            try:
-                if sub_app.updater and sub_app.updater.running:
-                    await sub_app.updater.stop()
-                if sub_app.running:
-                    await sub_app.stop()
-                await sub_app.shutdown()
-            except Exception as e:
-                logger.warning(f"Gagal menghentikan {key} saat shutdown: {e}")
+    """Menghentikan Bot Kedua (@prov_snw_bot) dengan bersih saat aplikasi dimatikan."""
+    prov_app = application.bot_data.get("prov_app")
+    if prov_app:
+        try:
+            if prov_app.updater and prov_app.updater.running:
+                await prov_app.updater.stop()
+            if prov_app.running:
+                await prov_app.stop()
+            await prov_app.shutdown()
+        except Exception as e:
+            logger.warning(f"Gagal menghentikan prov_app saat shutdown: {e}")
 
 async def handle_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menangani tombol Kembali ke Menu Utama."""

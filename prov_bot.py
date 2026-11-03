@@ -295,6 +295,23 @@ def pop_prov_pending_action() -> str | None:
     return action
 
 
+def set_prov_pending_kirim(ticket_no: str, tech_nik: str, chat_id: int | None = None):
+    state = _load_prov_state()
+    state["pending_kirim_ticket"] = ticket_no
+    state["pending_kirim_nik"] = tech_nik
+    if chat_id:
+        state["target_chat_id"] = chat_id
+    _save_prov_state(state)
+
+
+def pop_prov_pending_kirim() -> tuple[str | None, str | None]:
+    state = _load_prov_state()
+    ticket_no = state.pop("pending_kirim_ticket", None)
+    tech_nik = state.pop("pending_kirim_nik", None)
+    _save_prov_state(state)
+    return ticket_no, tech_nik
+
+
 def _build_prov_opener():
     cj = http.cookiejar.MozillaCookieJar(config.PROV_MYBRANCH_COOKIES_FILE)
     if os.path.exists(config.PROV_MYBRANCH_COOKIES_FILE):
@@ -1254,6 +1271,211 @@ async def capture_absensi_provisioning() -> tuple[bytes, str, str]:
 
 
 # ==============================================================================
+# OTOMASI REASSIGN / KIRIM TIKET DI ROSTER (/apps/roster/assign)
+# ==============================================================================
+
+async def reassign_roster_ticket(ticket_no: str, tech_nik: str) -> tuple[bytes, str]:
+    """
+    Otomasi Reassign / Kirim Tiket di Roster MyBranch:
+    1. Buka https://takalbagbar.id/mybranch/apps/roster/assign
+    2. Masukkan tiket ke 'Cari WO / tiket langsung' (textarea) lalu klik 'Cari'.
+    3. Di tabel hasil pencarian, klik tombol 'Reassign' (atau 'Assign').
+    4. Di modal popup:
+       - Centang aktif 'Semua teknisi (lintas workzone)'
+       - Masukkan NIK teknisi pada input 'Cari nama / NIK teknisi...'
+       - Klik kartu nama teknisi yang muncul
+       - Muncul notifikasi konfirmasi berwarna merah -> centang konfirmasi tersebut
+       - Klik tombol Reassign / Assign massal
+    5. Tunggu proses selesai dan tabel ter-update.
+    6. Ambil screenshot card tabel hasil reassign.
+    Mengembalikan (screenshot_bytes, caption).
+    """
+    cookies = _get_prov_playwright_cookies() or _get_playwright_cookies()
+    if not cookies:
+        raise ProvMyBranchAuthNeeded("Belum ada sesi login MyBranch yang aktif.")
+
+    target_url = f"{config.MYBRANCH_URL}/apps/roster/assign"
+    clean_ticket = ticket_no.strip()
+    clean_nik = re.sub(r"\s+", "", tech_nik.strip())
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+        context = await browser.new_context(
+            viewport={"width": 1400, "height": 900},
+            device_scale_factor=2,
+            color_scheme="dark",
+            user_agent=USER_AGENT,
+        )
+        await context.add_cookies(cookies)
+        page = await context.new_page()
+
+        try:
+            await page.add_init_script("""() => {
+                try {
+                    localStorage.setItem('theme', 'dark');
+                    document.documentElement.classList.add('dark');
+                    document.documentElement.style.colorScheme = 'dark';
+                } catch (e) {}
+            }""")
+
+            logger.info(f"[ProvBot] Membuka Assign Roster: {target_url}")
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(3000)
+
+            if "/auth/login" in page.url:
+                fallback_cookies = _get_playwright_cookies()
+                if fallback_cookies and fallback_cookies != cookies:
+                    await context.clear_cookies()
+                    await context.add_cookies(fallback_cookies)
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+                    await page.wait_for_timeout(3000)
+
+            if "/auth/login" in page.url:
+                raise ProvMyBranchAuthNeeded("Sesi login MyBranch telah kedaluwarsa.")
+
+            # Cari textarea pencarian tiket langsung
+            await page.wait_for_selector('textarea[placeholder*="WO065466463"], textarea', timeout=25000)
+            textarea = await page.query_selector('textarea[placeholder*="WO065466463"], textarea')
+            if not textarea:
+                raise Exception("Input textarea 'Cari WO / tiket langsung' tidak ditemukan.")
+
+            await textarea.fill(clean_ticket)
+            cari_btn = await page.query_selector('button:has-text("Cari")')
+            if not cari_btn:
+                raise Exception("Tombol 'Cari' tidak ditemukan.")
+            await cari_btn.click()
+            await page.wait_for_timeout(3500)
+
+            # Cek tabel hasil pencarian
+            rows = await page.query_selector_all("table tbody tr")
+            if not rows:
+                raise Exception(f"Tiket / WO `{clean_ticket}` tidak ditemukan di Assign Roster.")
+
+            first_row = rows[0]
+            row_text = await first_row.inner_text()
+            logger.info(f"[ProvBot] Baris tiket ditemukan: {row_text.replace(chr(10), ' | ')}")
+
+            # Cari tombol Reassign / Assign di baris tiket
+            reassign_btn = await first_row.query_selector('button:has-text("Reassign"), button:has-text("Assign")')
+            if not reassign_btn:
+                status_m = re.search(r"\b(COMPWORK|COMPLETE|CLOSE|CANCLWORK|CANCELWORK|WORKFAIL)\b", row_text, re.I)
+                st_info = status_m.group(1) if status_m else "Selesai/Tidak Aktif"
+                raise Exception(f"Tiket `{clean_ticket}` ditemukan (Status: {st_info}), namun tombol Reassign/Assign tidak tersedia.")
+
+            await reassign_btn.click()
+            await page.wait_for_timeout(1800)
+
+            # Di modal popup:
+            # 1. Centang 'Semua teknisi (lintas workzone)'
+            lintas_cb = await page.query_selector('label:has-text("Semua teknisi (lintas workzone)") input[type="checkbox"]')
+            if lintas_cb and not await lintas_cb.is_checked():
+                await lintas_cb.check()
+                await page.wait_for_timeout(500)
+
+            # 2. Input NIK teknisi di kolom pencarian
+            search_tech = await page.query_selector('input[placeholder*="Cari nama"]')
+            if not search_tech:
+                raise Exception("Input pencarian teknisi di modal tidak ditemukan.")
+
+            await search_tech.fill(clean_nik)
+            await search_tech.dispatch_event("input")
+            await page.wait_for_timeout(1500)
+
+            # 3. Klik kartu teknisi yang sesuai dengan NIK
+            tech_btn = await page.query_selector(f'.overflow-y-auto button:has-text("{clean_nik}")')
+            if not tech_btn:
+                raise Exception(f"Teknisi dengan NIK `{clean_nik}` tidak ditemukan di daftar teknisi roster.")
+
+            tech_text_raw = await tech_btn.inner_text()
+            selected_tech_name = tech_text_raw.split("\n")[0].strip() if tech_text_raw else clean_nik
+            logger.info(f"[ProvBot] Memilih teknisi: {selected_tech_name} ({clean_nik})")
+            await tech_btn.click()
+            await page.wait_for_timeout(1000)
+
+            # 4. Cari notifikasi konfirmasi berwarna merah & centang
+            red_box = await page.query_selector('div.border-error\\/30, div[class*="border-error"], div[class*="bg-error"]')
+            if red_box:
+                red_cb = await red_box.query_selector('input[type="checkbox"]')
+                if red_cb and not await red_cb.is_checked():
+                    await red_cb.check()
+                    logger.info("[ProvBot] Centang konfirmasi merah diaktifkan.")
+                    await page.wait_for_timeout(500)
+
+            # 5. Cari tombol submit Reassign/Assign yang sudah aktif
+            submit_btn = await page.query_selector(
+                '.fixed button:has-text("Reassign"):not([disabled]), '
+                '.fixed button:has-text("Assign"):not([disabled]), '
+                '.fixed button:has-text("Assign massal"):not([disabled]), '
+                'div.flex button:has-text("Reassign"):not([disabled]), '
+                'div.flex button:has-text("Assign massal"):not([disabled])'
+            )
+            if not submit_btn:
+                raise Exception("Tombol konfirmasi Reassign belum aktif. Pastikan teknisi dan centang konfirmasi sudah terpilih.")
+
+            submit_label = await submit_btn.inner_text()
+            logger.info(f"[ProvBot] Mengklik tombol submit reassign: '{submit_label}'")
+            await submit_btn.click()
+
+            # Tunggu proses backend dan modal tertutup
+            await page.wait_for_timeout(4000)
+
+            # Ambil screenshot card tabel hasil reassign
+            parent_card = await page.evaluate_handle('() => { const el = document.querySelector("div.overflow-x-auto"); return el ? el.parentElement : document.querySelector("table"); }')
+            card_el = parent_card.as_element() if parent_card else None
+
+            if card_el:
+                await card_el.scroll_into_view_if_needed()
+                await page.wait_for_timeout(500)
+                ss_bytes = await card_el.screenshot()
+            else:
+                table_el = await page.query_selector("div.overflow-x-auto, table")
+                if table_el:
+                    await table_el.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(500)
+                    ss_bytes = await table_el.screenshot()
+                else:
+                    ss_bytes = await page.screenshot(full_page=False)
+
+            # Ambil rincian data baris tabel setelah diperbarui
+            updated_cells = await page.query_selector_all("table tbody tr td")
+            texts = [(await c.inner_text()).strip() for c in updated_cells]
+            ticket_disp = clean_ticket
+            sto_disp = "-"
+            status_disp = "-"
+            tech_disp = f"{selected_tech_name} ({clean_nik})"
+            if len(texts) >= 5:
+                wo_raw = texts[1].split("\n")[0].strip() if texts[1] else clean_ticket
+                ticket_disp = wo_raw
+                sto_disp = texts[2] if len(texts) > 2 else "-"
+                status_disp = texts[3] if len(texts) > 3 else "-"
+                tech_raw = texts[4].replace("\n", " ") if len(texts) > 4 else tech_disp
+                tech_disp = tech_raw
+
+            now_str = datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M WIB")
+            caption = (
+                f"✅ *Kirim / Reassign Tiket Berhasil (ROSTER)*\n"
+                f"📋 *No Tiket / WO:* `{ticket_disp}`\n"
+                f"👷 *Teknisi Baru:* {tech_disp}\n"
+                f"📌 *Status:* `{status_disp}`\n"
+                f"🌐 *STO:* `{sto_disp}`\n"
+                f"🕒 *Waktu:* {now_str}"
+            )
+            return ss_bytes, caption
+
+        finally:
+            await context.close()
+            await browser.close()
+
+
+# ==============================================================================
 # HANDLERS TELEGRAM UNTUK BOT KEDUA (@prov_snw_bot)
 # ==============================================================================
 
@@ -1316,10 +1538,9 @@ async def prov_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔗 *MyBranch:* `takalbagbar.id/mybranch`\n"
         f"👤 *User Tactical:* `{config.PROV_MYBRANCH_NIK}`\n\n"
         "*Daftar Perintah:*\n"
-        "• `cek absen` atau `/cek_absen` — SS & Data Absensi Teknisi Provisioning Singkawang\n"
-        "• `/assignWO` — Assign Workorder PSB ke NIK Teknisi (via FLOW)\n"
-        "• `/assignWO <NO_WO> <NIK>` — Assign langsung 1 baris\n"
-        "  _(Contoh: `/assignWO WO049029919 16840720`)_\n"
+        "• `/kirim <TIKET> <NIK>` — Reassign Tiket / WO di Roster MyBranch\n"
+        "• `/assignWO <NO_WO> <NIK>` — Assign Workorder PSB (FLOW)\n"
+        "• `cek absen` atau `/cek_absen` — SS & Data Absensi Provisioning\n"
         "• `/cancel` — Batalkan proses yang sedang berjalan\n\n"
         "Silakan pilih tombol di bawah atau ketik perintah:"
     )
@@ -1429,6 +1650,50 @@ async def _execute_assign_wo(chat_id: int, context: ContextTypes.DEFAULT_TYPE, w
         logger.error(f"[ProvBot] Error saat assign_wo_psb({clean_wo}, {clean_nik}): {e}", exc_info=True)
         await status_msg.edit_text(
             f"❌ *Terjadi kesalahan saat Assign WO PSB:*\n`{e}`",
+            parse_mode="Markdown",
+        )
+
+
+async def _execute_kirim_ticket(chat_id: int, context: ContextTypes.DEFAULT_TYPE, ticket_no: str, tech_nik: str, status_msg=None):
+    """Menjalankan reassign_roster_ticket dan mengirimkan screenshot tabel hasilnya ke chat_id (tanpa tombol menu)."""
+    clean_ticket = ticket_no.strip().upper()
+    clean_nik = re.sub(r"\s+", "", tech_nik.strip())
+
+    if status_msg is None:
+        status_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⏳ _Sedang memproses Kirim / Reassign Tiket di Roster MyBranch..._\n"
+                f"📋 *Tiket / WO:* `{clean_ticket}`\n"
+                f"👷 *NIK Teknisi:* `{clean_nik}`"
+            ),
+            parse_mode="Markdown",
+        )
+    else:
+        await status_msg.edit_text(
+            f"⏳ _Sedang memproses Kirim / Reassign Tiket di Roster MyBranch..._\n"
+            f"📋 *Tiket / WO:* `{clean_ticket}`\n"
+            f"👷 *NIK Teknisi:* `{clean_nik}`",
+            parse_mode="Markdown",
+        )
+
+    try:
+        ss_bytes, caption = await reassign_roster_ticket(clean_ticket, clean_nik)
+        await status_msg.delete()
+        # Kirim hasil screenshot TANPA inline menu tombol di bawahnya
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=io.BytesIO(ss_bytes),
+            caption=caption,
+            parse_mode="Markdown",
+        )
+    except ProvMyBranchAuthNeeded:
+        set_prov_pending_kirim(clean_ticket, clean_nik, chat_id)
+        await _start_prov_login_flow(chat_id, context, status_msg)
+    except Exception as e:
+        logger.error(f"[ProvBot] Error saat reassign_roster_ticket({clean_ticket}, {clean_nik}): {e}", exc_info=True)
+        await status_msg.edit_text(
+            f"❌ *Terjadi kesalahan saat Kirim / Reassign Tiket:*\n`{e}`",
             parse_mode="Markdown",
         )
 
@@ -1567,6 +1832,49 @@ async def handle_assign_wo_command(update: Update, context: ContextTypes.DEFAULT
     )
 
 
+async def handle_kirim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handler untuk perintah /kirim atau /reassign.
+    Mendukung:
+    1. Langsung: /kirim <TIKET/WO> <NIK>
+    2. Hanya Tiket: /kirim <TIKET/WO> -> lanjut minta NIK
+    3. Tanpa argumen: /kirim -> minta No Tiket -> minta NIK
+    """
+    chat_id = update.effective_chat.id
+    cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batalkan", callback_data="prov_cancel")]])
+
+    args = list(context.args) if context.args else []
+    if len(args) >= 2:
+        ticket_no = args[0].strip().upper()
+        tech_nik = args[1].strip()
+        context.user_data.clear()
+        await _execute_kirim_ticket(chat_id, context, ticket_no, tech_nik)
+        return
+
+    if len(args) == 1:
+        ticket_no = args[0].strip().upper()
+        context.user_data["prov_kirim_ticket"] = ticket_no
+        context.user_data["prov_step"] = "awaiting_kirim_nik"
+        await update.effective_message.reply_text(
+            f"📋 *Tiket / WO:* `{ticket_no}`\n\n"
+            "Sekarang silakan masukkan **NIK Teknisi** tujuan di Roster:\n"
+            "_(Contoh: `16022256` atau `16983329`)_",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb,
+        )
+        return
+
+    context.user_data["prov_step"] = "awaiting_kirim_ticket"
+    context.user_data.pop("prov_kirim_ticket", None)
+    await update.effective_message.reply_text(
+        "🚀 *Kirim / Reassign Tiket (Assign Roster)*\n\n"
+        "Silakan masukkan **Nomor Tiket / WO** yang akan di-reassign:\n"
+        "_(Contoh: `WO067623440` atau `INC53841630`)_",
+        parse_mode="Markdown",
+        reply_markup=cancel_kb,
+    )
+
+
 async def handle_prov_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Menangani pesan teks di @prov_snw_bot:
@@ -1603,6 +1911,7 @@ async def handle_prov_text_input(update: Update, context: ContextTypes.DEFAULT_T
         if res.get("ok"):
             pending_act = pop_prov_pending_action()
             wo_num, tech_nik = pop_prov_pending_assign()
+            kirim_ticket, kirim_nik = pop_prov_pending_kirim()
             if pending_act == "cek_absen":
                 await status_msg.edit_text(
                     f"✅ *Login MyBranch (`{config.PROV_MYBRANCH_NIK}`) Berhasil!*\n"
@@ -1617,10 +1926,17 @@ async def handle_prov_text_input(update: Update, context: ContextTypes.DEFAULT_T
                     parse_mode="Markdown",
                 )
                 await _execute_assign_wo(chat_id, context, wo_num, tech_nik, status_msg=status_msg)
+            elif kirim_ticket and kirim_nik:
+                await status_msg.edit_text(
+                    f"✅ *Login MyBranch (`{config.PROV_MYBRANCH_NIK}`) Berhasil!*\n"
+                    f"⏳ _Melanjutkan proses Reassign Tiket `{kirim_ticket}` ke NIK `{kirim_nik}`..._",
+                    parse_mode="Markdown",
+                )
+                await _execute_kirim_ticket(chat_id, context, kirim_ticket, kirim_nik, status_msg=status_msg)
             else:
                 await status_msg.edit_text(
                     f"✅ *Login MyBranch (`{config.PROV_MYBRANCH_NIK}`) Berhasil!*\n"
-                    "Sesi telah disimpan secara permanen. Silakan gunakan `/assignWO` atau ketik `cek absen`.",
+                    "Sesi telah disimpan secara permanen. Silakan gunakan `/kirim`, `/assignWO`, atau ketik `cek absen`.",
                     parse_mode="Markdown",
                 )
             return
@@ -1653,6 +1969,13 @@ async def handle_prov_text_input(update: Update, context: ContextTypes.DEFAULT_T
             args = parts[1:]
         context.args = args
         await handle_assign_wo_command(update, context)
+        return
+
+    if lower_text.startswith("kirim") or lower_text.startswith("reassign"):
+        parts = text.split()
+        args = parts[1:]
+        context.args = args
+        await handle_kirim_command(update, context)
         return
 
     # 3. Tahapan interaktif: menunggu Nomor WO ('awaiting_wo')
@@ -1711,6 +2034,51 @@ async def handle_prov_text_input(update: Update, context: ContextTypes.DEFAULT_T
         await _execute_assign_wo(chat_id, context, wo_num, tech_nik)
         return
 
+    # 5. Tahapan interaktif: menunggu Tiket untuk Kirim / Reassign ('awaiting_kirim_ticket')
+    if prov_step == "awaiting_kirim_ticket":
+        tokens = text.split()
+        if len(tokens) >= 2 and any(ch.isdigit() for ch in tokens[0]) and tokens[1].isdigit():
+            ticket_no = tokens[0].upper()
+            tech_nik = tokens[1]
+            context.user_data.clear()
+            await _execute_kirim_ticket(chat_id, context, ticket_no, tech_nik)
+            return
+
+        ticket_cand = tokens[0].upper() if tokens else ""
+        if not ticket_cand:
+            await update.effective_message.reply_text(
+                "⚠️ Nomor Tiket/WO tidak valid. Masukkan Nomor Tiket (contoh: `WO067623440` atau `INC53841630`):",
+                parse_mode="Markdown",
+                reply_markup=cancel_kb,
+            )
+            return
+        context.user_data["prov_kirim_ticket"] = ticket_cand
+        context.user_data["prov_step"] = "awaiting_kirim_nik"
+        await update.effective_message.reply_text(
+            f"📋 *Tiket / WO:* `{ticket_cand}`\n\n"
+            "Sekarang silakan masukkan **NIK Teknisi** tujuan di Roster:\n"
+            "_(Contoh: `16022256` atau `16983329`)_",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb,
+        )
+        return
+
+    # 6. Tahapan interaktif: menunggu NIK untuk Kirim / Reassign ('awaiting_kirim_nik')
+    if prov_step == "awaiting_kirim_nik":
+        ticket_no = context.user_data.get("prov_kirim_ticket", "")
+        nik_match = re.search(r"\b(\d{5,15})\b", text)
+        tech_nik = nik_match.group(1) if nik_match else re.sub(r"\s+", "", text)
+        if not tech_nik or not any(ch.isdigit() for ch in tech_nik):
+            await update.effective_message.reply_text(
+                f"⚠️ Format NIK tidak valid. Silakan masukkan angka **NIK Teknisi** tujuan untuk tiket `{ticket_no}`:",
+                parse_mode="Markdown",
+                reply_markup=cancel_kb,
+            )
+            return
+        context.user_data.clear()
+        await _execute_kirim_ticket(chat_id, context, ticket_no, tech_nik)
+        return
+
     # 5. Balas balasan (reply) atau mention di grup dengan santai/nyeleneh jika bukan perintah
     reply_msg = update.effective_message.reply_to_message
     is_reply_to_bot = bool(reply_msg and reply_msg.from_user and reply_msg.from_user.id == context.bot.id)
@@ -1729,8 +2097,9 @@ async def prov_post_init(application):
     """Mendaftarkan menu perintah (/) untuk @prov_snw_bot khusus di grup -1004346054239."""
     asyncio.create_task(asyncio.to_thread(_load_prov_state))
     commands = [
-        BotCommand("cek_absen", "📋 Cek Absensi Teknisi Provisioning Singkawang"),
+        BotCommand("kirim", "🚀 Reassign Tiket ke NIK di Roster"),
         BotCommand("assignwo", "🛠️ Assign WO PSB ke NIK Teknisi (FLOW)"),
+        BotCommand("cek_absen", "📋 Cek Absensi Teknisi Provisioning Singkawang"),
         BotCommand("start", "🏠 Menu Utama Bot Provisioning"),
         BotCommand("cancel", "❌ Batalkan Proses"),
     ]
@@ -1778,6 +2147,12 @@ def build_prov_application():
 
     app.add_handler(CommandHandler(["start", "help"], prov_start))
     app.add_handler(CommandHandler(["cancel", "batal"], prov_cancel))
+    app.add_handler(
+        CommandHandler(
+            ["kirim", "reassign"],
+            handle_kirim_command,
+        )
+    )
     app.add_handler(
         CommandHandler(
             ["assignWO", "assignwo", "assign_wo", "assign"],
